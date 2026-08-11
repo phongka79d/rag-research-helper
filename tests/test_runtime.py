@@ -1,4 +1,4 @@
-from runtime.engine import RuntimeEngine, build_sources
+from runtime.engine import MAX_EVIDENCE_CHARS_PER_SECTION, RuntimeEngine, build_sources
 
 
 class FakeDB:
@@ -21,12 +21,15 @@ class FakeDB:
 
 
 class FakeDAG:
-    def __init__(self):
+    def __init__(self, graph_context=None):
         self.calls = []
+        self.graph_context = graph_context or [
+            {"source": "Matrix", "relation": "PREREQUISITE_OF", "target": "LoRA"}
+        ]
 
     def get_graph_context(self, concepts, search_mode):
         self.calls.append((concepts, search_mode))
-        return [{"source": "Matrix", "relation": "PREREQUISITE_OF", "target": "LoRA"}]
+        return self.graph_context
 
 
 class FakeLLM:
@@ -86,6 +89,26 @@ def test_ask_reports_missing_sources_without_calling_llm():
         "graph_context": [],
     }
     assert llm.answer_args is None
+
+
+def test_ask_bounds_evidence_and_graph_context_before_answering():
+    oversized_section = section()
+    oversized_section["page_content"] = "start " + ("middle " * 2_000) + "end"
+    oversized_graph = [
+        {"source": str(index), "description": "x" * 1_000}
+        for index in range(20)
+    ]
+    llm = FakeLLM()
+    dag = FakeDAG(oversized_graph)
+
+    result = RuntimeEngine(llm, FakeDB([oversized_section]), dag).ask("Explain LoRA")
+
+    evidence = llm.answer_args["sections"][0]["page_content"]
+    assert len(evidence) <= MAX_EVIDENCE_CHARS_PER_SECTION
+    assert evidence.startswith("start")
+    assert evidence.endswith("end")
+    assert len(llm.answer_args["graph_context"]) < len(oversized_graph)
+    assert result["graph_context"] == llm.answer_args["graph_context"]
 
 
 def test_teach_uses_original_section_and_step_concepts():

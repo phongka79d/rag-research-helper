@@ -73,3 +73,58 @@ def test_concepts_merge_across_sources_and_traverse():
                 prefix=prefix,
             )
         manager.close()
+
+
+def test_visual_graph_filters_relationships_by_source_locator():
+    manager = Neo4jManager(Settings())
+    prefix = f"test-{uuid.uuid4().hex}"
+    first = f"{prefix}-First"
+    second = f"{prefix}-Second"
+    first_source = {"source": f"{prefix}-a.pdf", "section": "Method"}
+    second_source = {"source": f"{prefix}-b.pdf", "section": "Results"}
+    first_locator = f"{first_source['source']}::{first_source['section']}"
+    second_locator = f"{second_source['source']}::{second_source['section']}"
+    try:
+        manager.verify_connection()
+        manager.save_knowledge_graph(
+            nodes=[{"name": first}, {"name": second}],
+            edges=[
+                {
+                    "source": first,
+                    "target": second,
+                    "relation": "PREREQUISITE_OF",
+                }
+            ],
+            source=first_source,
+            main_entities=[],
+        )
+        manager.save_knowledge_graph(
+            nodes=[{"name": first}, {"name": second}],
+            edges=[
+                {"source": second, "target": first, "relation": "RELATES_TO"}
+            ],
+            source=second_source,
+            main_entities=[],
+        )
+
+        first_edges = manager.get_visual_graph(first_locator)["edges"]
+        second_edges = manager.get_visual_graph(second_locator)["edges"]
+
+        assert [(edge["source"], edge["label"], edge["target"]) for edge in first_edges] == [
+            (first, "PREREQUISITE_OF", second)
+        ]
+        assert [(edge["source"], edge["label"], edge["target"]) for edge in second_edges] == [
+            (second, "RELATES_TO", first)
+        ]
+
+        manager.remove_source_locator(first_source)
+
+        assert manager.get_visual_graph(first_locator)["edges"] == []
+        assert manager.get_visual_graph(second_locator)["edges"] == second_edges
+    finally:
+        with manager.driver.session() as session:
+            session.run(
+                "MATCH (c:Concept) WHERE c.id STARTS WITH $prefix DETACH DELETE c",
+                prefix=prefix,
+            )
+        manager.close()

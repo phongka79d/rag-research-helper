@@ -14,10 +14,10 @@ class Settings:
 
     def __init__(self) -> None:
         self.OPENAI_BASE_URL = os.getenv(
-            "OPENAI_BASE_URL", "https://api.openai.com/v1"
+            "OPENAI_BASE_URL", "https://api.shopaikey.com/v1"
         ).rstrip("/")
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-        self.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+        self.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.OPENAI_EMBEDDING_MODEL = os.getenv(
             "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
         )

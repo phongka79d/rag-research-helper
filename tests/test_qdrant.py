@@ -106,6 +106,52 @@ def test_roadmap_steps_are_stored_in_sequence_order():
         delete_store(store)
 
 
+def test_parent_hash_and_delete_replace_only_parent_points():
+    store = make_store()
+    try:
+        parent_id = "c" * 32
+        metadata = {
+            "source": "lora.md",
+            "section": "Method",
+            "seq_id": 1,
+            "page_start": 3,
+            "page_end": 4,
+            "content_hash": "current-content",
+        }
+        store.upsert_section("LoRA method text.", metadata, parent_id)
+        store.upsert_roadmap_step(
+            {"seq_id": 0, "title": "Mechanism", "content_focus": "low rank"},
+            parent_id,
+            metadata,
+        )
+        store.upsert_questions(
+            [{"question": "How does LoRA work?", "key_knowledge": "Low rank."}],
+            parent_id,
+            "lora.md",
+        )
+        other_parent_id = "d" * 32
+        store.upsert_section("Unrelated section.", metadata, other_parent_id)
+        store.upsert_questions(
+            [{"question": "What is unrelated?", "key_knowledge": "Separate."}],
+            other_parent_id,
+            "lora.md",
+        )
+
+        assert store.section_exists(parent_id, "current-content")
+        assert not store.section_exists(parent_id, "stale-content")
+
+        store.delete_parent(parent_id)
+
+        assert not store.section_exists(parent_id)
+        assert store.get_roadmap(parent_id) == []
+        assert store.section_exists(other_parent_id)
+        assert (
+            store.client.count(store.questions_collection, exact=True).count == 1
+        )
+    finally:
+        delete_store(store)
+
+
 def test_existing_wrong_dimension_is_reported_without_recreating_collection():
     token = uuid.uuid4().hex
     store = make_store(embedding_dim=3, token=token)

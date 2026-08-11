@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from hashlib import sha256
 from typing import Any
 
 from qdrant_client import QdrantClient, models
@@ -78,7 +79,14 @@ class QdrantVectorStore:
     def _section_point_id(parent_id: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{parent_id}_section"))
 
-    def section_exists(self, parent_id: str) -> bool:
+    def section_exists(self, parent_id: str, content_hash: str | None = None) -> bool:
+        """Check a parent anchor and optionally its compiled content hash."""
+        if content_hash is not None:
+            section = self._fetch_parent(parent_id)
+            return bool(
+                section
+                and section["metadata"].get("content_hash") == content_hash
+            )
         return bool(
             self.client.count(
                 collection_name=self.curriculum_collection,
@@ -86,6 +94,16 @@ class QdrantVectorStore:
                 exact=True,
             ).count
         )
+
+    def delete_parent(self, parent_id: str) -> None:
+        """Remove only the stored Qdrant points belonging to one parent section."""
+        selector = models.FilterSelector(filter=self._filter(parent_id=parent_id))
+        for collection_name in (self.curriculum_collection, self.questions_collection):
+            self.client.delete(
+                collection_name=collection_name,
+                points_selector=selector,
+                wait=True,
+            )
 
     def upsert_section(
         self, text: str, metadata: dict[str, Any], parent_id: str
@@ -95,6 +113,8 @@ class QdrantVectorStore:
             "parent_id": parent_id,
             "type": "section_anchor",
             "page_content": text,
+            "content_hash": metadata.get("content_hash")
+            or sha256(text.encode("utf-8")).hexdigest(),
         }
         self.client.upsert(
             collection_name=self.curriculum_collection,

@@ -98,11 +98,48 @@ class Neo4jManager:
                     f"""
                     MATCH (source:Concept {{id: $source}})
                     MATCH (target:Concept {{id: $target}})
-                    MERGE (source)-[:{relation}]->(target)
+                    MERGE (source)-[relationship:{relation}]->(target)
+                    SET relationship.source_locators = CASE
+                        WHEN $locator IN coalesce(relationship.source_locators, [])
+                        THEN relationship.source_locators
+                        ELSE coalesce(relationship.source_locators, []) + $locator
+                    END
                     """,
                     source=source_name,
                     target=target_name,
+                    locator=locator,
                 )
+
+    def remove_source_locator(self, source: dict[str, Any]) -> None:
+        """Remove one source locator's graph contribution without touching others."""
+        locator = self._locator(source)
+        with self.driver.session() as session:
+            session.run(
+                """
+                MATCH ()-[relationship]->()
+                WHERE $locator IN coalesce(relationship.source_locators, [])
+                WITH relationship,
+                    [item IN relationship.source_locators WHERE item <> $locator] AS locators
+                SET relationship.source_locators = locators
+                WITH relationship
+                WHERE size(relationship.source_locators) = 0
+                DELETE relationship
+                """,
+                locator=locator,
+            )
+            session.run(
+                """
+                MATCH (concept:Concept)
+                WHERE $locator IN coalesce(concept.source_locators, [])
+                WITH concept,
+                    [item IN concept.source_locators WHERE item <> $locator] AS locators
+                SET concept.source_locators = locators
+                WITH concept
+                WHERE size(concept.source_locators) = 0
+                DETACH DELETE concept
+                """,
+                locator=locator,
+            )
 
     def get_graph_context(
         self, node_names: list[str], search_mode: str = "search"
@@ -165,8 +202,10 @@ class Neo4jManager:
         edge_where = (
             ""
             if locator is None
-            else "WHERE $locator IN coalesce(source.source_locators, []) "
-            "AND $locator IN coalesce(target.source_locators, [])"
+            else "WHERE $locator IN coalesce(relationship.source_locators, []) "
+            "OR (relationship.source_locators IS NULL "
+            "AND $locator IN coalesce(source.source_locators, []) "
+            "AND $locator IN coalesce(target.source_locators, []))"
         )
         with self.driver.session() as session:
             node_records = session.run(
