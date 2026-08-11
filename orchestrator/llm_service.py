@@ -26,15 +26,27 @@ class LLMService:
         self.model = settings.OPENAI_MODEL
         self.embedding_model = settings.OPENAI_EMBEDDING_MODEL
 
-    def _chat(self, system: str, user: str) -> str:
+    def _chat(
+        self,
+        system: str,
+        user: str,
+        max_output_tokens: int | None = None,
+        json_output: bool = False,
+    ) -> str:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if max_output_tokens is not None:
+            request["max_output_tokens"] = max_output_tokens
+        if json_output:
+            request["reasoning"] = {"effort": "minimal"}
+            request["text"] = {"format": {"type": "json_object"}}
         try:
-            response = self.client.responses.create(
-                model=self.model,
-                input=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-            )
+            response = self.client.responses.create(**request)
         except OpenAIError as error:
             raise RuntimeError(f"OpenAI Responses API request failed: {error}") from error
         content = response.output_text
@@ -115,7 +127,9 @@ Existing concept names:
 Source section:
 {section_text}
 """.strip()
-        result = SectionAOTResult.model_validate(self._json_object(self._chat(system, user)))
+        result = SectionAOTResult.model_validate(
+            self._json_object(self._chat(system, user, json_output=True))
+        )
         return result.model_dump()
 
     def generate_hypothetical_questions(
@@ -138,7 +152,7 @@ or experimental details. Return:
 Raw source section:
 {section_text}
 """.strip()
-        payload = self._json_object(self._chat(system, user))
+        payload = self._json_object(self._chat(system, user, json_output=True))
         pairs = [HypotheticalQA.model_validate(item) for item in payload.get("qa_pairs", [])]
         if len(pairs) != num_questions:
             raise RuntimeError(
@@ -168,7 +182,14 @@ candidate list, preserve relevance order, and do not repeat an ID.
 """.strip()
         allowed = {candidate.get("parent_id", "") for candidate in candidates}
         try:
-            selected = self._json_object(self._chat(system, user)).get("best_parent_ids", [])
+            selected = self._json_object(
+                self._chat(
+                    system,
+                    user,
+                    max_output_tokens=512,
+                    json_output=True,
+                )
+            ).get("best_parent_ids", [])
         except RuntimeError:
             logger.warning("LLM rerank response was invalid; using the top vector candidate.")
             selected = []

@@ -57,7 +57,12 @@ def test_concepts_merge_across_sources_and_traverse():
         ]
         assert subgraph["prerequisites"] == [matrix]
         assert subgraph["related_concepts"] == [qlora]
-        assert {edge["label"] for edge in visual["edges"]} == {
+        test_edges = [
+            edge
+            for edge in visual["edges"]
+            if edge["source"].startswith(prefix) and edge["target"].startswith(prefix)
+        ]
+        assert {edge["label"] for edge in test_edges} == {
             "PREREQUISITE_OF",
             "RELATES_TO",
         }

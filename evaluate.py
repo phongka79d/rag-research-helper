@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -84,39 +85,45 @@ def hyde_rerank(
         limit=25,
         with_payload=True,
     ).points
-    candidates = [
-        {
-            "question": str((point.payload or {}).get("page_content", "")),
-            "parent_id": str((point.payload or {}).get("parent_id", "")),
-            "key_knowledge": str((point.payload or {}).get("key_knowledge", "")),
-        }
-        for point in points
-        if (point.payload or {}).get("parent_id")
-    ]
+    candidates_by_parent: dict[str, dict[str, str]] = {}
+    for point in points:
+        payload = point.payload or {}
+        parent_id = str(payload.get("parent_id", ""))
+        if parent_id:
+            candidates_by_parent.setdefault(
+                parent_id,
+                {
+                    "question": str(payload.get("page_content", "")),
+                    "parent_id": parent_id,
+                    "key_knowledge": str(payload.get("key_knowledge", "")),
+                },
+            )
+    candidates = list(candidates_by_parent.values())
     return llm.rerank_candidate_questions(query, candidates, limit=5), candidates
 
 
 def anchors_for_parents(db: QdrantVectorStore, parent_ids: list[str]) -> list[str]:
+    if not parent_ids:
+        return []
+    records, _ = db.client.scroll(
+        collection_name=db.curriculum_collection,
+        scroll_filter=models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="type", match=models.MatchValue(value="section_anchor")
+                ),
+                models.FieldCondition(
+                    key="parent_id", match=models.MatchAny(any=parent_ids)
+                ),
+            ]
+        ),
+        limit=len(parent_ids),
+        with_payload=True,
+        with_vectors=False,
+    )
     anchors: list[str] = []
-    for parent_id in parent_ids:
-        records, _ = db.client.scroll(
-            collection_name=db.curriculum_collection,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="type", match=models.MatchValue(value="section_anchor")
-                    ),
-                    models.FieldCondition(
-                        key="parent_id", match=models.MatchValue(value=parent_id)
-                    ),
-                ]
-            ),
-            limit=1,
-            with_payload=True,
-            with_vectors=False,
-        )
-        if records:
-            anchors.extend((records[0].payload or {}).get("anchor_nodes", []))
+    for record in records:
+        anchors.extend((record.payload or {}).get("anchor_nodes", []))
     return list(dict.fromkeys(anchor for anchor in anchors if anchor))
 
 
@@ -129,10 +136,27 @@ def summarize_method(
     return result
 
 
-def run_evaluation(dataset_path: Path = DATASET_PATH) -> dict[str, Any]:
+def evaluate_case(
+    query: str,
+    query_vector: list[float],
+    db: QdrantVectorStore,
+    llm: LLMService,
+    dag: Neo4jManager,
+) -> tuple[list[str], list[str], int]:
+    baseline = parent_baseline(db, query_vector)
+    reranked_ids, _ = hyde_rerank(db, llm, query, query_vector)
+    graph_context = dag.get_graph_context(
+        anchors_for_parents(db, reranked_ids), search_mode="search"
+    )
+    return baseline, reranked_ids, len(graph_context)
+
+
+def run_evaluation(dataset_path: Path = DATASET_PATH, workers: int = 4) -> dict[str, Any]:
     cases = json.loads(dataset_path.read_text(encoding="utf-8"))
     if len(cases) < 20:
         raise ValueError("Evaluation dataset must contain at least 20 questions.")
+    if workers < 1:
+        raise ValueError("workers must be at least 1.")
 
     settings = Settings()
     settings.validate()
@@ -141,22 +165,26 @@ def run_evaluation(dataset_path: Path = DATASET_PATH) -> dict[str, Any]:
     dag = Neo4jManager(settings)
     dag.verify_connection()
 
-    expected = [expected_parent_ids(case) for case in cases]
-    baseline_rankings: list[list[str]] = []
-    hyde_rankings: list[list[str]] = []
-    graph_edges: list[int] = []
-
-    for case in cases:
-        query = case["query"]
-        query_vector = llm.embed(query)
-        baseline_rankings.append(parent_baseline(db, query_vector))
-        reranked_ids, _ = hyde_rerank(db, llm, query, query_vector)
-        graph_context = dag.get_graph_context(
-            anchors_for_parents(db, reranked_ids), search_mode="search"
-        )
-        graph_edges.append(len(graph_context))
-
-    dag.close()
+    try:
+        expected = [expected_parent_ids(case) for case in cases]
+        queries = [case["query"] for case in cases]
+        query_vectors = llm.embed_many(queries)
+        with ThreadPoolExecutor(max_workers=min(workers, len(cases))) as executor:
+            case_results = list(
+                executor.map(
+                    evaluate_case,
+                    queries,
+                    query_vectors,
+                    [db] * len(cases),
+                    [llm] * len(cases),
+                    [dag] * len(cases),
+                )
+            )
+    finally:
+        dag.close()
+    baseline_rankings = [result[0] for result in case_results]
+    hyde_rankings = [result[1] for result in case_results]
+    graph_edges = [result[2] for result in case_results]
     return {
         "question_count": len(cases),
         "categories": sorted({case["category"] for case in cases}),
@@ -176,8 +204,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
     parser.add_argument("--output", type=Path, default=RESULTS_PATH)
+    parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
-    result = run_evaluation(args.dataset)
+    result = run_evaluation(args.dataset, workers=args.workers)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
 

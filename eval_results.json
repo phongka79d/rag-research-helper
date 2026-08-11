@@ -1,0 +1,23 @@
+{
+  "question_count": 20,
+  "categories": [
+    "conceptual",
+    "cross-paper",
+    "factual",
+    "relational"
+  ],
+  "parent_section_vector_baseline": {
+    "recall_at_5": 0.95,
+    "mrr": 0.4325
+  },
+  "hyde_question_rerank": {
+    "recall_at_5": 0.95,
+    "mrr": 0.7166666666666667
+  },
+  "hyde_question_rerank_graph_context": {
+    "recall_at_5": 0.95,
+    "mrr": 0.7166666666666667,
+    "average_graph_edges": 16.95
+  },
+  "note": "Graph context enriches answer generation after retrieval, so its Recall@5 and MRR match HyDE plus rerank; average_graph_edges reports the added context."
+}

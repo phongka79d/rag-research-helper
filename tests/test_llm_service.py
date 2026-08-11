@@ -80,6 +80,11 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
         "test-chat",
         "test-chat",
     ]
+    assert all(
+        call["reasoning"] == {"effort": "minimal"}
+        and call["text"] == {"format": {"type": "json_object"}}
+        for call in service.client.responses.calls
+    )
 
 
 def test_rerank_filters_unknown_ids_and_preserves_fallback():
@@ -95,6 +100,11 @@ def test_rerank_filters_unknown_ids_and_preserves_fallback():
     assert service.rerank_candidate_questions("How is QLoRA different?", candidates) == [
         "qlora"
     ]
+    assert service.client.responses.calls[0]["max_output_tokens"] == 512
+    assert service.client.responses.calls[0]["reasoning"] == {"effort": "minimal"}
+    assert service.client.responses.calls[0]["text"] == {
+        "format": {"type": "json_object"}
+    }
 
 
 def test_rerank_honors_explicit_result_limit():
