@@ -1,0 +1,22 @@
+[
+  {"category":"factual","query":"Which weights remain frozen in the LoRA method?","expected":[{"source":"demo_lora.md","section":"Method"}]},
+  {"category":"factual","query":"What rank does the illustrative LoRA setup use?","expected":[{"source":"demo_lora.md","section":"Method"}]},
+  {"category":"factual","query":"What scaling alpha is used for illustrative LoRA?","expected":[{"source":"demo_lora.md","section":"Method"}]},
+  {"category":"factual","query":"What learning rate is used in the LoRA example?","expected":[{"source":"demo_lora.md","section":"Method"}]},
+  {"category":"factual","query":"What batch size is used in the LoRA example?","expected":[{"source":"demo_lora.md","section":"Method"}]},
+  {"category":"factual","query":"Which quantization format does QLoRA use for base weights?","expected":[{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"factual","query":"What rank and scaling are used by the illustrative QLoRA adapter?","expected":[{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"conceptual","query":"Why does LoRA use low-rank adapter matrices?","expected":[{"source":"demo_lora.md","section":"Abstract"},{"source":"demo_lora.md","section":"Results"}]},
+  {"category":"conceptual","query":"How can one base model support several tasks with LoRA?","expected":[{"source":"demo_lora.md","section":"Results"}]},
+  {"category":"conceptual","query":"What is the role of the frozen pretrained matrix W0 in LoRA?","expected":[{"source":"demo_lora.md","section":"Method"}]},
+  {"category":"conceptual","query":"What does double quantization compress in QLoRA?","expected":[{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"conceptual","query":"Why are paged optimizers useful in the QLoRA note?","expected":[{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"relational","query":"How do the low-rank matrices relate to the LoRA update?","expected":[{"source":"demo_lora.md","section":"Method"}]},
+  {"category":"relational","query":"What is the relationship between adapters and the base model in LoRA?","expected":[{"source":"demo_lora.md","section":"Results"}]},
+  {"category":"relational","query":"How do quantized base weights and LoRA adapters work together in QLoRA?","expected":[{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"relational","query":"How does QLoRA preserve the core LoRA idea?","expected":[{"source":"demo_qlora.md","section":"Results"}]},
+  {"category":"cross-paper","query":"How does QLoRA extend LoRA for memory-constrained fine-tuning?","expected":[{"source":"demo_lora.md","section":"Method"},{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"cross-paper","query":"Compare the base-model treatment in LoRA and QLoRA.","expected":[{"source":"demo_lora.md","section":"Method"},{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"cross-paper","query":"What do LoRA and QLoRA both keep separate from each task?","expected":[{"source":"demo_lora.md","section":"Results"},{"source":"demo_qlora.md","section":"Results"}]},
+  {"category":"cross-paper","query":"Compare the adapter ranks in the illustrative LoRA and QLoRA notes.","expected":[{"source":"demo_lora.md","section":"Method"},{"source":"demo_qlora.md","section":"Method"}]}
+]

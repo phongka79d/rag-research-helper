@@ -1,0 +1,8 @@
+qdrant-client
+neo4j
+pydantic
+python-dotenv
+pypdf
+streamlit
+pytest
+openai
