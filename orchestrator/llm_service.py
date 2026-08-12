@@ -1,4 +1,4 @@
-"""Direct official OpenAI Responses and Embeddings API calls."""
+"""Direct OpenAI-compatible Responses and Embeddings API calls."""
 
 from __future__ import annotations
 
@@ -18,12 +18,19 @@ ANSWER_MAX_OUTPUT_TOKENS = 800
 TEACH_MAX_OUTPUT_TOKENS = 1_000
 
 
+def _safe_provider_error(error: Exception, api_key: str) -> str:
+    """Keep provider diagnostics useful without returning the configured key."""
+    message = str(error).strip() or error.__class__.__name__
+    return message.replace(api_key, "[redacted]") if api_key else message
+
+
 class LLMService:
     """The application's single direct OpenAI-compatible API client."""
 
     def __init__(self, settings: Any) -> None:
+        self._api_key = settings.OPENAI_API_KEY
         self.client = OpenAI(
-            api_key=settings.OPENAI_API_KEY,
+            api_key=self._api_key,
             base_url=settings.OPENAI_BASE_URL.rstrip("/"),
         )
         self.model = settings.OPENAI_MODEL
@@ -46,15 +53,21 @@ class LLMService:
         if max_output_tokens is not None:
             request["max_output_tokens"] = max_output_tokens
         if json_output:
-            request["reasoning"] = {"effort": "minimal"}
+            # Ponytail: the configured provider accepts JSON mode but rejects the
+            # model-specific `reasoning.effort` parameter for gpt-4o-mini.
             request["text"] = {"format": {"type": "json_object"}}
         try:
             response = self.client.responses.create(**request)
         except OpenAIError as error:
-            raise RuntimeError(f"OpenAI Responses API request failed: {error}") from error
+            raise RuntimeError(
+                "OpenAI-compatible provider Responses request failed: "
+                f"{_safe_provider_error(error, self._api_key)}"
+            ) from error
         content = response.output_text
         if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("OpenAI Responses API returned an empty completion.")
+            raise RuntimeError(
+                "OpenAI-compatible provider Responses API returned an empty completion."
+            )
         return content.strip()
 
     @staticmethod
@@ -79,9 +92,14 @@ class LLMService:
             )
             embedding = response.data[0].embedding
         except (OpenAIError, AttributeError, IndexError, TypeError) as error:
-            raise RuntimeError("OpenAI Embeddings API returned no embedding vector.") from error
+            raise RuntimeError(
+                "OpenAI-compatible provider Embeddings request failed: "
+                f"{_safe_provider_error(error, self._api_key)}"
+            ) from error
         if not embedding:
-            raise RuntimeError("OpenAI Embeddings API returned an empty embedding.")
+            raise RuntimeError(
+                "OpenAI-compatible provider Embeddings API returned an empty embedding."
+            )
         return [float(value) for value in embedding]
 
     def embed_many(self, texts: list[str]) -> list[list[float]]:
@@ -93,9 +111,14 @@ class LLMService:
             )
             vectors = [item.embedding for item in response.data]
         except (OpenAIError, AttributeError, TypeError) as error:
-            raise RuntimeError("OpenAI Embeddings API returned no embedding vectors.") from error
+            raise RuntimeError(
+                "OpenAI-compatible provider Embeddings request failed: "
+                f"{_safe_provider_error(error, self._api_key)}"
+            ) from error
         if len(vectors) != len(texts) or any(not vector for vector in vectors):
-            raise RuntimeError("OpenAI Embeddings API returned incomplete embeddings.")
+            raise RuntimeError(
+                "OpenAI-compatible provider Embeddings API returned incomplete embeddings."
+            )
         return [[float(value) for value in vector] for vector in vectors]
 
     def extract_section_plan_and_graph(

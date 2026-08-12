@@ -1,5 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
+from openai import OpenAIError
+
+import orchestrator.llm_service as llm_service
 from orchestrator.llm_service import (
     ANSWER_MAX_OUTPUT_TOKENS,
     TEACH_MAX_OUTPUT_TOKENS,
@@ -46,6 +50,53 @@ def make_service():
     )
 
 
+def test_client_uses_configured_compatible_endpoint_and_models(monkeypatch):
+    captured = {}
+
+    class CapturingOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(llm_service, "OpenAI", CapturingOpenAI)
+
+    service = make_service()
+
+    assert captured == {
+        "api_key": "test-key",
+        "base_url": "http://endpoint.test/v1",
+    }
+    assert service.model == "test-chat"
+    assert service.embedding_model == "test-embedding"
+
+
+def test_provider_failures_are_operation_specific_and_redact_api_key():
+    class FailingResponses:
+        def create(self, **kwargs):
+            raise OpenAIError("provider rejected test-key")
+
+    class FailingEmbeddings:
+        def create(self, **kwargs):
+            raise OpenAIError("provider rejected test-key")
+
+    service = make_service()
+    service.client = SimpleNamespace(responses=FailingResponses())
+
+    with pytest.raises(RuntimeError) as responses_error:
+        service._chat("system", "user")
+
+    assert "Responses request failed" in str(responses_error.value)
+    assert "test-key" not in str(responses_error.value)
+    assert "[redacted]" in str(responses_error.value)
+
+    service.client = SimpleNamespace(embeddings=FailingEmbeddings())
+    with pytest.raises(RuntimeError) as embeddings_error:
+        service.embed("text")
+
+    assert "Embeddings request failed" in str(embeddings_error.value)
+    assert "test-key" not in str(embeddings_error.value)
+    assert "[redacted]" in str(embeddings_error.value)
+
+
 def test_embedding_methods_use_openai_sdk_payloads():
     service = make_service()
     service.client = FakeClient(
@@ -85,7 +136,7 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
         "test-chat",
     ]
     assert all(
-        call["reasoning"] == {"effort": "minimal"}
+        "reasoning" not in call
         and call["text"] == {"format": {"type": "json_object"}}
         for call in service.client.responses.calls
     )
@@ -105,7 +156,7 @@ def test_rerank_filters_unknown_ids_and_preserves_fallback():
         "qlora"
     ]
     assert service.client.responses.calls[0]["max_output_tokens"] == 512
-    assert service.client.responses.calls[0]["reasoning"] == {"effort": "minimal"}
+    assert "reasoning" not in service.client.responses.calls[0]
     assert service.client.responses.calls[0]["text"] == {
         "format": {"type": "json_object"}
     }

@@ -1,4 +1,4 @@
-"""Runtime settings loaded from the local .env file."""
+"""Runtime settings loaded from the local .env file and process environment."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ load_dotenv()
 
 
 class Settings:
-    """Small, direct configuration holder for the application."""
+    """Small, direct configuration holder for one OpenAI-compatible provider."""
 
     def __init__(self) -> None:
         self.OPENAI_BASE_URL = os.getenv(
@@ -31,7 +31,9 @@ class Settings:
 
     def validate(self, require_openai: bool = True) -> None:
         if require_openai and not self.OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY is required in .env.")
+            raise RuntimeError(
+                "OPENAI_API_KEY is required in .env or the process environment."
+            )
         if not self.NEO4J_PASSWORD:
             raise RuntimeError(
                 "NEO4J_PASSWORD is required in .env. Run python setup_env.py --start."

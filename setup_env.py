@@ -20,9 +20,9 @@ KNOWN_NEO4J_CONTAINERS = (
 )
 NEO4J_DATA_VOLUME = "rag-research-helper_neo4j_data"
 DEFAULTS = {
-    "OPENAI_BASE_URL": "https://api.openai.com/v1",
+    "OPENAI_BASE_URL": "https://api.shopaikey.com/v1",
     "OPENAI_API_KEY": "",
-    "OPENAI_MODEL": "gpt-5",
+    "OPENAI_MODEL": "gpt-4o-mini",
     "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
     "OPENAI_EMBEDDING_DIM": "1536",
     "QDRANT_URL": "http://localhost:6333",

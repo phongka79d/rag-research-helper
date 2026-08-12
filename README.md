@@ -8,7 +8,7 @@ RAG Research Helper is a local Streamlit app for exploring research papers as a 
 - **Teach:** turn a stored section roadmap into step-by-step lessons with prerequisite context.
 - **Graph:** inspect concepts and relations extracted from a selected paper section.
 
-The implementation intentionally stays small: the official OpenAI SDK provides intelligence, Qdrant provides semantic retrieval, Neo4j stores concept relationships, and Python wires the flow together. It does not use LangChain, LangGraph, or production-style service/repository layers.
+The implementation intentionally stays small: the OpenAI Python SDK sends requests to one configured OpenAI-compatible provider, Qdrant provides semantic retrieval, Neo4j stores concept relationships, and Python wires the flow together. It does not use LangChain, LangGraph, or production-style service/repository layers.
 
 ## What This Folder Does
 
@@ -18,7 +18,7 @@ This repository is the complete local application. The implementation plan in `R
 - `core/data_ingestion.py` for ahead-of-time (AOT) paper compilation.
 - `database/structural_db.py` for Qdrant storage and retrieval.
 - `database/semantic_dag.py` for the Neo4j concept graph.
-- `orchestrator/llm_service.py` for the official OpenAI Responses and Embeddings API calls.
+- `orchestrator/llm_service.py` for direct OpenAI-compatible Responses and Embeddings API calls.
 - `runtime/engine.py` for the direct Ask and Teach flows.
 
 Do not casually reset or delete local Neo4j volumes: they can contain existing graph data. `setup_env.py` is the safe credential and connectivity utility.
@@ -115,8 +115,8 @@ The key storage model is deliberately narrow:
 
 | Component | Purpose | Defined by |
 | --- | --- | --- |
-| OpenAI Responses API | AOT extraction, hypothetical questions, reranking, answers, and lessons | `orchestrator/llm_service.py` |
-| OpenAI Embeddings API | Query, section, roadmap, and question vectors | `orchestrator/llm_service.py` |
+| OpenAI-compatible Responses API | AOT extraction, hypothetical questions, reranking, answers, and lessons | `orchestrator/llm_service.py` |
+| OpenAI-compatible Embeddings API | Query, section, roadmap, and question vectors | `orchestrator/llm_service.py` |
 | Qdrant | Parent sections, roadmap steps, and hypothetical question retrieval | `database/structural_db.py` |
 | Neo4j | Shared research concepts and bounded graph context | `database/semantic_dag.py` |
 | `data/papers/` | Uploaded/local paper files | `main.py` |
@@ -128,8 +128,8 @@ Copy `.env.example` to `.env`; never commit `.env` or its values.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `OPENAI_BASE_URL` | No | Responses/Embeddings endpoint; defaults to the official OpenAI API URL. |
-| `OPENAI_API_KEY` | Yes for app and evaluation | Credentials passed to the official OpenAI SDK. |
+| `OPENAI_BASE_URL` | No | OpenAI-compatible `/v1` base URL; defaults to `https://api.shopaikey.com/v1`. |
+| `OPENAI_API_KEY` | Yes for app and evaluation | Credential passed to the configured provider through the OpenAI SDK. |
 | `OPENAI_MODEL` | No | Text model; defaults to `gpt-4o-mini`. |
 | `OPENAI_EMBEDDING_MODEL` | No | Embedding model; defaults to `text-embedding-3-small`. |
 | `OPENAI_EMBEDDING_DIM` | No | Qdrant vector size; defaults to `1536`. It must match the configured embedding model. |
@@ -149,6 +149,15 @@ Copy `.env.example` to `.env`; never commit `.env` or its values.
    ```
 
 2. Copy `.env.example` to `.env`, then set `OPENAI_API_KEY`.
+
+   The configured provider must support both the OpenAI Responses (`/v1/responses`) and Embeddings (`/v1/embeddings`) contracts used by this app. Changing any `OPENAI_*` value requires stopping and fully restarting Streamlit; refreshing the browser is not enough. A process-level `OPENAI_*` variable takes precedence over `.env`.
+
+   Before ingesting a paper, run the opt-in compatibility checks. Each makes one provider request and does not write to Qdrant or Neo4j:
+
+   ```powershell
+   python scripts/live_test_responses.py
+   python scripts/live_test_embeddings.py
+   ```
 
 3. Run the safe local database setup. It does not print the Neo4j password and refuses to reset existing Neo4j data when the credential cannot be verified.
 
@@ -174,7 +183,7 @@ docker compose up -d qdrant neo4j
 streamlit run main.py
 ```
 
-Upload a PDF, `.md`, or `.markdown` file in the sidebar. Ingestion uses the configured OpenAI endpoint and writes the compiled material into the local Qdrant and Neo4j services.
+Upload a PDF, `.md`, or `.markdown` file in the sidebar. Ingestion uses the configured OpenAI-compatible endpoint and writes the compiled material into the local Qdrant and Neo4j services.
 
 ## Testing and Validation
 
@@ -197,7 +206,7 @@ The evaluation requires reachable Qdrant and Neo4j services, a configured OpenAI
 - Read `RAG_Research_Helper_Simple_Reference_First_Rebuild_Plan.md` before changing behavior; it intentionally forbids extra architecture.
 - Before changing a major module, inspect the matching `rag-expert-mentor` reference file listed in the plan. Adapt the small relevant pattern; do not copy unrelated features wholesale.
 - Preserve the direct flow: `RuntimeEngine` calls Qdrant, Neo4j, and `LLMService` directly. Do not introduce repositories, services, adapters, factories, dependency injection, LangChain, or LangGraph.
-- Keep JSON-producing OpenAI calls in `LLMService` structured with minimal reasoning. The rerank call has a bounded token allowance because an overly small budget can be consumed by hidden reasoning before JSON is emitted.
+- Keep JSON-producing compatible-provider calls in `LLMService` in JSON mode. The rerank call has a bounded token allowance so it can return its required JSON selection.
 - Keep `.env` private. Before any Neo4j-dependent change, verify the existing database safely; never delete/reset data or volumes automatically.
 - When changing ingestion, coordinate `core/data_ingestion.py`, `database/structural_db.py`, `database/semantic_dag.py`, and their focused tests. Preserve the parent-child `parent_id` contract and exactly five stored hypothetical questions per section.
 - When changing retrieval behavior, validate `tests/test_qdrant.py`, `tests/test_runtime.py`, and `evaluate.py`; test a real Ask path when configured services are available.
