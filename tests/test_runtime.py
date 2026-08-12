@@ -27,8 +27,8 @@ class FakeDAG:
             {"source": "Matrix", "relation": "PREREQUISITE_OF", "target": "LoRA"}
         ]
 
-    def get_graph_context(self, concepts, search_mode):
-        self.calls.append((concepts, search_mode))
+    def get_graph_context(self, concepts, search_mode, source=""):
+        self.calls.append((concepts, search_mode, source))
         return self.graph_context
 
 
@@ -75,7 +75,7 @@ def test_ask_returns_answer_graph_context_and_sources():
         ],
     }
     assert db.search_args["target_file"] == "lora.pdf"
-    assert dag.calls == [(["LoRA", "Matrix"], "search")]
+    assert dag.calls == [(["LoRA", "Matrix"], "search", "lora.pdf")]
     assert llm.answer_args["sections"] == [section()]
 
 
@@ -109,6 +109,7 @@ def test_ask_bounds_evidence_and_graph_context_before_answering():
     assert evidence.endswith("end")
     assert len(llm.answer_args["graph_context"]) < len(oversized_graph)
     assert result["graph_context"] == llm.answer_args["graph_context"]
+    assert dag.calls == [(["LoRA", "Matrix"], "search", "")]
 
 
 def test_teach_uses_original_section_and_step_concepts():
@@ -120,7 +121,10 @@ def test_teach_uses_original_section_and_step_concepts():
         "Lesson: Motivation",
         "Lesson: Mechanism",
     ]
-    assert [call[1] for call in dag.calls] == ["semi_search", "semi_search"]
+    assert dag.calls == [
+        (["LoRA"], "semi_search", "lora.pdf"),
+        (["Matrix"], "semi_search", "lora.pdf"),
+    ]
     assert all(call["section_text"] == "LoRA freezes base weights." for call in llm.teach_args)
 
 

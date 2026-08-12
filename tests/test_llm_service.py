@@ -140,6 +140,9 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
         and call["text"] == {"format": {"type": "json_object"}}
         for call in service.client.responses.calls
     )
+    prompt = service.client.responses.calls[0]["input"][1]["content"]
+    assert "earlier sections of this same paper" in prompt
+    assert "must\n  occur in this current source section" in prompt
 
 
 def test_rerank_filters_unknown_ids_and_preserves_fallback():

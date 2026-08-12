@@ -128,3 +128,104 @@ def test_visual_graph_filters_relationships_by_source_locator():
                 prefix=prefix,
             )
         manager.close()
+
+
+def test_remove_source_locator_preserves_concept_shared_by_another_source():
+    manager = Neo4jManager(Settings())
+    prefix = f"test-{uuid.uuid4().hex}"
+    shared = f"{prefix}-Shared"
+    first_source = {"source": f"{prefix}-a.pdf", "section": "References"}
+    second_source = {"source": f"{prefix}-b.pdf", "section": "Method"}
+    first_locator = f"{first_source['source']}::{first_source['section']}"
+    second_locator = f"{second_source['source']}::{second_source['section']}"
+    try:
+        manager.verify_connection()
+        for source in (first_source, second_source):
+            manager.save_knowledge_graph(
+                nodes=[{"name": shared, "description": "Shared concept."}],
+                edges=[],
+                source=source,
+                main_entities=[shared],
+            )
+
+        manager.remove_source_locator(first_source)
+
+        remaining = manager.get_visual_graph(second_locator)["nodes"]
+        assert remaining == [
+            {
+                "id": shared,
+                "description": "Shared concept.",
+                "source_locators": [second_locator],
+                "is_main": True,
+            }
+        ]
+        assert manager.get_visual_graph(first_locator)["nodes"] == []
+    finally:
+        with manager.driver.session() as session:
+            session.run(
+                "MATCH (c:Concept) WHERE c.id STARTS WITH $prefix DETACH DELETE c",
+                prefix=prefix,
+            )
+        manager.close()
+
+
+def test_graph_context_filters_relationship_provenance_by_source_prefix():
+    manager = Neo4jManager(Settings())
+    prefix = f"test-{uuid.uuid4().hex}"
+    anchor = f"{prefix}-Anchor"
+    first = f"{prefix}-First"
+    second = f"{prefix}-Second"
+    first_source = {"source": f"{prefix}-paper.pdf", "section": "Method"}
+    second_source = {
+        "source": f"{prefix}-paper.pdf-extra",
+        "section": "Results",
+    }
+    try:
+        manager.verify_connection()
+        manager.save_knowledge_graph(
+            nodes=[{"name": first}, {"name": anchor}],
+            edges=[
+                {
+                    "source": first,
+                    "target": anchor,
+                    "relation": "PREREQUISITE_OF",
+                }
+            ],
+            source=first_source,
+            main_entities=[],
+        )
+        manager.save_knowledge_graph(
+            nodes=[{"name": second}, {"name": anchor}],
+            edges=[
+                {
+                    "source": second,
+                    "target": anchor,
+                    "relation": "RELATES_TO",
+                }
+            ],
+            source=second_source,
+            main_entities=[],
+        )
+
+        def relation_pairs(context):
+            return {(item["source"], item["relation"], item["target"]) for item in context}
+
+        expected_first = {(first, "PREREQUISITE_OF", anchor)}
+        expected_second = {(second, "RELATES_TO", anchor)}
+
+        assert relation_pairs(
+            manager.get_graph_context([anchor], search_mode="search", source=first_source["source"])
+        ) == expected_first
+        assert relation_pairs(
+            manager.get_graph_context([anchor], search_mode="semi_search", source=second_source["source"])
+        ) == expected_second
+        assert relation_pairs(manager.get_graph_context([anchor], search_mode="semi_search")) == (
+            expected_first | expected_second
+        )
+    finally:
+        with manager.driver.session() as session:
+            session.run(
+                "MATCH (c:Concept) WHERE c.id STARTS WITH $prefix DETACH DELETE c",
+                prefix=prefix,
+            )
+        manager.close()

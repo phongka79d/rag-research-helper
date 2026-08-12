@@ -144,8 +144,13 @@ Analyze this research-paper section and return exactly this JSON shape:
 Rules:
 - Produce 2 to 4 broad learning-roadmap steps when the section has enough material.
 - Use only PREREQUISITE_OF, RELATES_TO, PART_OF, or DESCRIBES for relations.
-- Reuse exact names from the existing concept list whenever the same or synonymous concept appears.
-- Ground every field in the source text.
+- The existing concept list contains terms from earlier sections of this same paper only.
+  Reuse an exact existing name only when that name is present in this current section.
+- Every main entity, roadmap concept, graph node name, and graph-edge endpoint must
+  occur in this current source section (case and punctuation may differ). Do not use
+  concepts from another paper or infer a named concept that is absent from the text.
+- Ground descriptions, roadmap titles, and content_focus in the source text; do not
+  add outside facts.
 
 Existing concept names:
 {json.dumps(existing_nodes, ensure_ascii=False)}

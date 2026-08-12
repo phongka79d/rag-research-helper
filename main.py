@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import perf_counter
+from typing import Any
 
 import streamlit as st
 
@@ -14,6 +16,12 @@ from orchestrator.llm_service import LLMService
 from runtime.engine import RuntimeEngine
 
 PAPERS_DIR = Path("data/papers")
+INGESTION_SUMMARY_KEY = "ingestion_summary"
+INGESTION_STATUS_LABELS = {
+    "compiling": "Compiling",
+    "compiled": "Compiled",
+    "up_to_date": "Already up to date",
+}
 
 
 def get_app_objects() -> tuple[RuntimeEngine, QdrantVectorStore, Neo4jManager]:
@@ -40,6 +48,24 @@ def paper_names(sections: list[dict]) -> list[str]:
     )
 
 
+def build_ingestion_summary(
+    result: dict[str, Any], elapsed_seconds: float
+) -> dict[str, int | float | bool]:
+    """Keep the completed ingestion result available for the post-rerun UI."""
+    report = result.get("report", {})
+    bibliography_omitted = (
+        bool(report.get("bibliography_omitted", False))
+        if isinstance(report, dict)
+        else False
+    )
+    return {
+        "compiled": len(result["ingested"]),
+        "up_to_date": len(result["skipped"]),
+        "bibliography_omitted": bibliography_omitted,
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
 def main() -> None:
     st.set_page_config(page_title="RAG Research Helper", layout="wide")
     st.title("RAG Research Helper")
@@ -56,23 +82,49 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Papers")
+        st.caption(f"Active process text model: `{engine.llm.model}`")
+        st.caption("Changes to `.env` take effect after restarting Streamlit.")
+        summary = st.session_state.get(INGESTION_SUMMARY_KEY)
+        if summary:
+            bibliography_status = "yes" if summary["bibliography_omitted"] else "no"
+            st.success(
+                "Compiled "
+                f"{summary['compiled']}; already up to date {summary['up_to_date']}; "
+                f"bibliography omitted: {bibliography_status}; "
+                f"elapsed: {summary['elapsed_seconds']:.1f}s."
+            )
         uploaded = st.file_uploader("Upload PDF or Markdown", type=["pdf", "md", "markdown"])
         force_reingest = st.checkbox("Force re-ingest", value=False)
         if uploaded and st.button("Ingest paper", use_container_width=True):
             PAPERS_DIR.mkdir(parents=True, exist_ok=True)
             destination = PAPERS_DIR / Path(uploaded.name).name
             destination.write_bytes(uploaded.getvalue())
+            progress_bar = st.progress(0)
+            section_status = st.empty()
+            compilation_status = st.empty()
+
+            def on_progress(event: dict[str, Any]) -> None:
+                total = max(int(event["total"]), 0)
+                completed = min(max(int(event["completed"]), 0), total)
+                progress = int(completed * 100 / total) if total else 0
+                status = INGESTION_STATUS_LABELS.get(event["status"], event["status"])
+                section_status.caption(f"Section: {event['section']}")
+                compilation_status.caption(f"{status}: {completed}/{total}")
+                progress_bar.progress(progress)
+
             try:
-                with st.spinner(f"Ingesting {destination.name}..."):
-                    result = ingest_document(
-                        destination,
-                        db,
-                        engine.llm,
-                        dag,
-                        force_reingest=force_reingest,
-                    )
-                st.success(
-                    f"Ingested {len(result['ingested'])}; skipped {len(result['skipped'])}."
+                started_at = perf_counter()
+                result = ingest_document(
+                    destination,
+                    db,
+                    engine.llm,
+                    dag,
+                    force_reingest=force_reingest,
+                    progress_callback=on_progress,
+                )
+                st.session_state[INGESTION_SUMMARY_KEY] = build_ingestion_summary(
+                    result,
+                    perf_counter() - started_at,
                 )
                 st.rerun()
             except Exception as error:

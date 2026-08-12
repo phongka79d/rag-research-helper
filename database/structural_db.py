@@ -127,6 +127,56 @@ class QdrantVectorStore:
             ],
         )
 
+    def upsert_curriculum_section(
+        self,
+        roadmap_steps: list[dict[str, Any]],
+        text: str,
+        roadmap_metadata: dict[str, Any],
+        section_metadata: dict[str, Any],
+        parent_id: str,
+    ) -> None:
+        """Store one section anchor and its roadmap with one embedding and write."""
+        embedding_inputs = [step["content_focus"] for step in roadmap_steps] + [text]
+        vectors = self.llm.embed_many(embedding_inputs)
+        if len(vectors) != len(embedding_inputs):
+            raise RuntimeError(
+                "Curriculum embeddings did not match roadmap steps and parent section."
+            )
+
+        points = []
+        for step, vector in zip(roadmap_steps, vectors[:-1]):
+            seq_id = int(step.get("seq_id", 0))
+            points.append(
+                models.PointStruct(
+                    id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{parent_id}_step_{seq_id}")),
+                    vector=vector,
+                    payload={
+                        **roadmap_metadata,
+                        "parent_id": parent_id,
+                        "type": "roadmap_step",
+                        "seq_id": seq_id,
+                        "title": step["title"],
+                        "content_focus": step["content_focus"],
+                        "concepts": step.get("concepts", []),
+                    },
+                )
+            )
+        points.append(
+            models.PointStruct(
+                id=self._section_point_id(parent_id),
+                vector=vectors[-1],
+                payload={
+                    **section_metadata,
+                    "parent_id": parent_id,
+                    "type": "section_anchor",
+                    "page_content": text,
+                    "content_hash": section_metadata.get("content_hash")
+                    or sha256(text.encode("utf-8")).hexdigest(),
+                },
+            )
+        )
+        self.client.upsert(collection_name=self.curriculum_collection, points=points)
+
     def upsert_questions(
         self,
         qa_pairs: list[dict[str, str]],

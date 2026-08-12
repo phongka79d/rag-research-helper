@@ -142,15 +142,24 @@ class Neo4jManager:
             )
 
     def get_graph_context(
-        self, node_names: list[str], search_mode: str = "search"
+        self,
+        node_names: list[str],
+        search_mode: str = "search",
+        source: str = "",
     ) -> list[dict[str, str]]:
         names = [name for name in dict.fromkeys(node_names) if name]
         if not names:
             return []
+        source_prefix = f"{source}::" if source else ""
         if search_mode == "semi_search":
             query = """
                 MATCH (source:Concept)-[relationship]->(target:Concept)
                 WHERE target.id IN $names
+                    AND (
+                        $source_prefix = ''
+                        OR any(locator IN coalesce(relationship.source_locators, [])
+                            WHERE locator STARTS WITH $source_prefix)
+                    )
                 RETURN DISTINCT source.id AS source,
                     coalesce(source.description, '') AS source_desc,
                     type(relationship) AS relation,
@@ -163,6 +172,9 @@ class Neo4jManager:
                 WHERE anchor.id IN $names
                 UNWIND relationships(path) AS relationship
                 WITH DISTINCT relationship
+                WHERE $source_prefix = ''
+                    OR any(locator IN coalesce(relationship.source_locators, [])
+                        WHERE locator STARTS WITH $source_prefix)
                 RETURN startNode(relationship).id AS source,
                     coalesce(startNode(relationship).description, '') AS source_desc,
                     type(relationship) AS relation,
@@ -170,7 +182,7 @@ class Neo4jManager:
                     coalesce(endNode(relationship).description, '') AS target_desc
             """
         with self.driver.session() as session:
-            records = session.run(query, names=names)
+            records = session.run(query, names=names, source_prefix=source_prefix)
             return [dict(record) for record in records]
 
     def get_concept_subgraph(

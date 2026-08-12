@@ -18,5 +18,9 @@
   {"category":"cross-paper","query":"How does QLoRA extend LoRA for memory-constrained fine-tuning?","expected":[{"source":"demo_lora.md","section":"Method"},{"source":"demo_qlora.md","section":"Method"}]},
   {"category":"cross-paper","query":"Compare the base-model treatment in LoRA and QLoRA.","expected":[{"source":"demo_lora.md","section":"Method"},{"source":"demo_qlora.md","section":"Method"}]},
   {"category":"cross-paper","query":"What do LoRA and QLoRA both keep separate from each task?","expected":[{"source":"demo_lora.md","section":"Results"},{"source":"demo_qlora.md","section":"Results"}]},
-  {"category":"cross-paper","query":"Compare the adapter ranks in the illustrative LoRA and QLoRA notes.","expected":[{"source":"demo_lora.md","section":"Method"},{"source":"demo_qlora.md","section":"Method"}]}
+  {"category":"cross-paper","query":"Compare the adapter ranks in the illustrative LoRA and QLoRA notes.","expected":[{"source":"demo_lora.md","section":"Method"},{"source":"demo_qlora.md","section":"Method"}]},
+  {"category":"conceptual","query":"Why does scaled dot-product attention divide by sqrt(d_k)?","expected":[{"source":"attention.pdf","section":"3.2.1 Scaled Dot-Product Attention"}]},
+  {"category":"conceptual","query":"How does decoder masking prevent attention from seeing future positions?","expected":[{"source":"attention.pdf","section":"3.2.3 Applications of Attention in our Model"}]},
+  {"category":"conceptual","query":"Why does the Transformer use positional encoding?","expected":[{"source":"attention.pdf","section":"3.5 Positional Encoding"}]},
+  {"category":"conceptual","query":"What does multi-head attention provide beyond a single attention head?","expected":[{"source":"attention.pdf","section":"3.2.2 Multi-Head Attention"}]}
 ]

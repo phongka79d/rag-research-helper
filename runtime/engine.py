@@ -105,7 +105,9 @@ class RuntimeEngine:
         sections = _bounded_sections(sections)
         graph_context = _bounded_graph_context(
             self.dag.get_graph_context(
-                collect_anchor_nodes(sections), search_mode="search"
+                collect_anchor_nodes(sections),
+                search_mode="search",
+                source=target_file,
             )
         )
         return {
@@ -129,7 +131,9 @@ class RuntimeEngine:
         lessons = []
         for step in roadmap:
             graph_context = self.dag.get_graph_context(
-                step.get("concepts", []), search_mode="semi_search"
+                step.get("concepts", []),
+                search_mode="semi_search",
+                source=target_file,
             )
             lessons.append(
                 {

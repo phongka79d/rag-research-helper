@@ -12,6 +12,8 @@ MARKDOWN_HEADING = re.compile(r"^(#{1,2})\s+(.+?)\s*#*\s*$")
 NUMBERED_HEADING = re.compile(
     r"^(?:(?:\d+(?:\.\d+)*)|(?:[IVXLC]+))[.)]?\s+[A-Z][A-Za-z0-9 ,:;()/_-]{1,100}$"
 )
+FOUR_DIGIT_YEAR_PREFIX = re.compile(r"^\d{4}\b")
+SECTION_PREFIX = re.compile(r"^(?:(?:\d+(?:\.\d+)*)|(?:[IVXLC]+))[.)]?\s+", re.IGNORECASE)
 COMMON_PAPER_HEADINGS = {
     "abstract",
     "introduction",
@@ -34,6 +36,13 @@ COMMON_PAPER_HEADINGS = {
 
 class DocumentProcessor:
     """Parse a paper into ordered full-section dictionaries."""
+
+    def __init__(self) -> None:
+        # Kept beside parsing so callers can report what this one parse retained.
+        self.last_report: dict[str, Any] = {
+            "retained_section_count": 0,
+            "bibliography_omitted": False,
+        }
 
     def process(self, file_path: str | Path) -> list[dict[str, Any]]:
         path = Path(file_path)
@@ -73,7 +82,9 @@ class DocumentProcessor:
             else:
                 lines.append(line)
         flush()
-        return self._with_sequence_ids(sections)
+        sections = self._with_sequence_ids(sections)
+        self._set_report(sections, bibliography_omitted=False)
+        return sections
 
     def process_pdf(self, file_path: str | Path) -> list[dict[str, Any]]:
         path = Path(file_path)
@@ -82,10 +93,12 @@ class DocumentProcessor:
             raise RuntimeError(f"Cannot extract text from encrypted PDF: {path.name}")
 
         sections: list[dict[str, Any]] = []
-        title = "Introduction"
+        title = ""
         lines: list[str] = []
         page_start = 1
         page_end = 1
+        body_started = False
+        bibliography_omitted = False
 
         def flush() -> None:
             content = "\n".join(lines).strip()
@@ -109,18 +122,40 @@ class DocumentProcessor:
                 line = raw_line.strip()
                 if not line:
                     continue
+                if body_started and self._is_references_heading(line):
+                    flush()
+                    bibliography_omitted = True
+                    break
+                if not body_started:
+                    if not self._is_pdf_body_start(line):
+                        continue
+                    body_started = True
+                    title = line
+                    page_start = page_number
+                    page_end = page_number
+                    continue
                 if self._is_pdf_heading(line):
                     flush()
                     title = line
                     page_start = page_number
                     page_end = page_number
                 else:
-                    if not lines:
-                        page_start = page_number
                     page_end = page_number
                     lines.append(line)
+            if bibliography_omitted:
+                break
         flush()
-        return self._with_sequence_ids(sections)
+        sections = self._with_sequence_ids(sections)
+        self._set_report(sections, bibliography_omitted=bibliography_omitted)
+        return sections
+
+    def _set_report(
+        self, sections: list[dict[str, Any]], bibliography_omitted: bool
+    ) -> None:
+        self.last_report = {
+            "retained_section_count": len(sections),
+            "bibliography_omitted": bibliography_omitted,
+        }
 
     @staticmethod
     def _with_sequence_ids(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -130,7 +165,22 @@ class DocumentProcessor:
 
     @staticmethod
     def _is_pdf_heading(line: str) -> bool:
+        if FOUR_DIGIT_YEAR_PREFIX.match(line):
+            return False
         normalized = line.lower().rstrip(":")
         if normalized in COMMON_PAPER_HEADINGS:
             return True
         return bool(NUMBERED_HEADING.match(line))
+
+    @staticmethod
+    def _is_pdf_body_start(line: str) -> bool:
+        normalized = line.lower().rstrip(":")
+        return normalized == "abstract" or (
+            not FOUR_DIGIT_YEAR_PREFIX.match(line)
+            and bool(NUMBERED_HEADING.match(line))
+        )
+
+    @staticmethod
+    def _is_references_heading(line: str) -> bool:
+        normalized = SECTION_PREFIX.sub("", line).lower().rstrip(":")
+        return normalized == "references"
