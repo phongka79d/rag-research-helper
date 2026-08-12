@@ -2557,7 +2557,7 @@ Acceptance:
 ```text
 one section
 → valid AOT JSON
-→ 5 hypothetical questions
+→ up to 5 directly answerable hypothetical questions
 ```
 
 ---
@@ -2722,7 +2722,7 @@ Project được coi là hoàn thành khi:
 - [ ] Neo4j graph is populated.
 - [ ] Section anchors stored in Qdrant.
 - [ ] Roadmap steps stored in Qdrant.
-- [ ] 5 hypothetical questions stored per section.
+- [ ] Up to 5 directly answerable hypothetical questions stored per section.
 - [ ] Child question points link to parent section.
 
 ## Ask

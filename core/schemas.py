@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ALLOWED_RELATIONS = {"PREREQUISITE_OF", "RELATES_TO", "PART_OF", "DESCRIBES"}
+MAX_GRAPH_VERIFIER_CANDIDATES = 12
 
 
 class GraphNode(BaseModel):
@@ -22,6 +23,25 @@ class GraphEdge(BaseModel):
     def normalize_relation(cls, relation: str) -> str:
         normalized = relation.strip().upper().replace(" ", "_")
         return normalized if normalized in ALLOWED_RELATIONS else "RELATES_TO"
+
+
+class GraphEdgeApproval(BaseModel):
+    """A verifier approval that can only reference an existing edge candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(strict=True)
+    quote: str = Field(min_length=1, max_length=500, strict=True)
+
+
+class GraphEdgeVerificationResult(BaseModel):
+    """Validated response shape for the bounded graph-edge verifier."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approvals: list[GraphEdgeApproval] = Field(
+        max_length=MAX_GRAPH_VERIFIER_CANDIDATES
+    )
 
 
 class KnowledgeGraph(BaseModel):

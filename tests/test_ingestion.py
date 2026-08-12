@@ -3,17 +3,21 @@ import threading
 import pytest
 
 from core.data_ingestion import (
+    _approved_graph_edges,
     collect_anchor_nodes,
     filter_aot_to_section,
     ingest_document,
     make_content_hash,
     make_parent_id,
 )
-from core.schemas import SectionAOTResult
+from core.schemas import MAX_GRAPH_VERIFIER_CANDIDATES, SectionAOTResult
 from database.document_processor import DocumentProcessor
 
 
-SECTION_TEXT = "LoRA freezes base weights and trains a low-rank matrix."
+SECTION_TEXT = (
+    "LoRA freezes base weights and trains a low-rank matrix. "
+    "A low-rank matrix is a component of LoRA."
+)
 
 
 def make_section(
@@ -58,7 +62,7 @@ def make_aot(include_unsupported: bool = False) -> dict:
                 {
                     "source": "Low-Rank Matrix",
                     "target": "LoRA",
-                    "relation": "PREREQUISITE_OF",
+                    "relation": "PART_OF",
                 },
                 *(
                     [
@@ -89,23 +93,36 @@ class FakeProcessor:
 
 
 class FakeLLM:
-    def __init__(self, aot: dict | None = None):
+    def __init__(self, aot: dict | None = None, edge_approvals: list[dict] | None = None):
         self.aot = aot or make_aot()
+        self.edge_approvals = edge_approvals
         self.aot_text = None
         self.question_text = None
+        self.section_title = None
         self.existing_node_calls: list[list[str]] = []
+        self.verify_calls = []
 
     def extract_section_plan_and_graph(self, text, existing_nodes):
         self.aot_text = text
         self.existing_node_calls.append(list(existing_nodes))
         return self.aot
 
-    def generate_hypothetical_questions(self, text, num_questions):
+    def generate_hypothetical_questions(self, text, num_questions, section_title=""):
         self.question_text = text
+        self.section_title = section_title
         assert num_questions == 5
         return [
             {"question": f"Question {index}", "key_knowledge": "Grounded answer."}
             for index in range(num_questions)
+        ]
+
+    def verify_graph_edges(self, section_text, candidates):
+        self.verify_calls.append((section_text, candidates))
+        if self.edge_approvals is not None:
+            return self.edge_approvals
+        return [
+            {"index": index, "quote": section_text}
+            for index, _candidate in enumerate(candidates)
         ]
 
 
@@ -120,15 +137,45 @@ class ConcurrentLLM(FakeLLM):
         assert self.questions_started.wait(2)
         return super().extract_section_plan_and_graph(text, existing_nodes)
 
-    def generate_hypothetical_questions(self, text, num_questions):
+    def generate_hypothetical_questions(self, text, num_questions, section_title=""):
         self.questions_started.set()
         assert self.aot_started.wait(2)
-        return super().generate_hypothetical_questions(text, num_questions)
+        return super().generate_hypothetical_questions(text, num_questions, section_title)
 
 
 class FailingQuestionsLLM(FakeLLM):
-    def generate_hypothetical_questions(self, text, num_questions):
+    def generate_hypothetical_questions(self, text, num_questions, section_title=""):
         raise RuntimeError("question generation failed")
+
+
+class ThinSectionLLM(FakeLLM):
+    def generate_hypothetical_questions(self, text, num_questions, section_title=""):
+        self.question_text = text
+        self.section_title = section_title
+        assert num_questions == 5
+        return []
+
+
+class FailingVerifierLLM(FakeLLM):
+    def verify_graph_edges(self, section_text, candidates):
+        raise RuntimeError("graph verification failed")
+
+
+class ConcurrentVerifierLLM(FakeLLM):
+    def __init__(self):
+        super().__init__()
+        self.questions_started = threading.Event()
+        self.verifier_started = threading.Event()
+
+    def generate_hypothetical_questions(self, text, num_questions, section_title=""):
+        self.questions_started.set()
+        assert self.verifier_started.wait(2)
+        return super().generate_hypothetical_questions(text, num_questions, section_title)
+
+    def verify_graph_edges(self, section_text, candidates):
+        self.verifier_started.set()
+        assert self.questions_started.wait(2)
+        return super().verify_graph_edges(section_text, candidates)
 
 
 class FakeDAG:
@@ -144,6 +191,23 @@ class FakeDAG:
 
     def remove_source_locator(self, metadata):
         self.removed.append(metadata)
+
+
+class FailingStaleCleanupDAG(FakeDAG):
+    def __init__(self, stale_section: str, store, stale_parent_id: str):
+        super().__init__()
+        self.stale_section = stale_section
+        self.store = store
+        self.stale_parent_id = stale_parent_id
+        self.fail_once = True
+
+    def remove_source_locator(self, metadata):
+        self.removed.append(metadata)
+        if metadata.get("section") == self.stale_section:
+            assert ("delete", self.stale_parent_id) not in self.store.calls
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("stale graph cleanup failed")
 
 
 class FakeStore:
@@ -246,6 +310,7 @@ def test_ingestion_writes_grounded_aot_in_curriculum_question_order():
     parent_id = make_parent_id({"source": "lora.md", "section": "Method"})
     assert result == expected_result(["lora.md::Method"], [])
     assert llm.aot_text == llm.question_text == SECTION_TEXT
+    assert llm.section_title == "Method"
     assert llm.existing_node_calls == [[]]
     assert [call[0] for call in store.calls] == ["delete", "curriculum", "questions"]
     assert store.calls[1][1][0]["seq_id"] == 0
@@ -340,6 +405,169 @@ def test_aot_filter_keeps_only_current_section_terms_and_paper_local_reuse():
     ][0]["concepts"] == ["LoRA", "Low-Rank Matrix"]
 
 
+def test_graph_edges_require_valid_grounded_verifier_approval():
+    text = "Alpha is part of Beta. Beta is related to Gamma."
+    edges = [
+        {"source": "Alpha", "target": "Beta", "relation": "PART_OF"},
+        {"source": "Beta", "target": "Gamma", "relation": "RELATES_TO"},
+        {"source": "Alpha", "target": "Alpha", "relation": "RELATES_TO"},
+        {"source": "Alpha", "target": "Gamma", "relation": "RELATES_TO"},
+        {"source": "Alpha", "target": "Gamma", "relation": "DESCRIBES"},
+    ]
+    aot = {
+        "main_entities": ["Alpha", "Beta", "Gamma"],
+        "learning_roadmap": [],
+        "knowledge_graph": {
+            "nodes": [{"name": name} for name in ("Alpha", "Beta", "Gamma")],
+            "edges": edges,
+        },
+    }
+    approvals = [
+        {"index": "0", "quote": "Alpha is part of Beta."},
+        {"index": True, "quote": "Beta is related to Gamma."},
+        {"index": -1, "quote": "Alpha is part of Beta."},
+        {"index": 9, "quote": "Alpha is part of Beta."},
+        {"index": 0, "quote": "Alpha appears elsewhere."},
+        {"index": 0, "quote": "Alpha is part of Beta."},
+        {"index": 1, "quote": "Beta is related to Gamma."},
+        {"index": 2, "quote": "Alpha is part of Beta."},
+        {"index": 3, "quote": "Alpha directly relates to Gamma."},
+        {"index": 4, "quote": "Alpha is part of Beta."},
+    ]
+    llm = FakeLLM(aot=aot, edge_approvals=approvals)
+    dag = FakeDAG()
+
+    ingest_document(
+        "ignored.md",
+        FakeStore(),
+        llm,
+        dag,
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert llm.verify_calls == [(text, edges)]
+    assert dag.saved[0]["edges"] == [edges[1]]
+    assert "quote" not in dag.saved[0]["edges"][0]
+
+
+def test_graph_quote_gate_rejects_generic_usage_property_and_evaluation_claims():
+    text = (
+        "The Transformer uses self-attention. The Transformer relies on attention "
+        "mechanisms. The Transformer has positional encodings. The model is evaluated "
+        "on a benchmark."
+    )
+    candidates = [
+        {"source": "self-attention", "relation": "PART_OF", "target": "Transformer"},
+        {
+            "source": "attention mechanisms",
+            "relation": "PREREQUISITE_OF",
+            "target": "Transformer",
+        },
+        {
+            "source": "Transformer",
+            "relation": "DESCRIBES",
+            "target": "positional encodings",
+        },
+        {"source": "model", "relation": "RELATES_TO", "target": "benchmark"},
+    ]
+    approvals = [{"index": index, "quote": text.split(". ")[index] + "."} for index in range(4)]
+
+    assert _approved_graph_edges(text, candidates, approvals) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "candidate"),
+    [
+        (
+            "Multi-head attention is a component of the Transformer.",
+            {
+                "source": "Multi-head attention",
+                "relation": "PART_OF",
+                "target": "Transformer",
+            },
+        ),
+        (
+            "Understanding dot-product attention is required before understanding multi-head attention.",
+            {
+                "source": "dot-product attention",
+                "relation": "PREREQUISITE_OF",
+                "target": "multi-head attention",
+            },
+        ),
+        (
+            "The attention mechanism explains token dependencies.",
+            {
+                "source": "attention mechanism",
+                "relation": "DESCRIBES",
+                "target": "token dependencies",
+            },
+        ),
+        (
+            "Positional encodings are related to token order.",
+            {
+                "source": "Positional encodings",
+                "relation": "RELATES_TO",
+                "target": "token order",
+            },
+        ),
+    ],
+)
+def test_graph_quote_gate_keeps_direct_directional_relation_evidence(text, candidate):
+    assert _approved_graph_edges(text, [candidate], [{"index": 0, "quote": text}]) == [
+        candidate
+    ]
+
+
+def test_graph_quote_gate_binds_whole_part_evidence_to_candidate_endpoints():
+    text = "Transformer uses self-attention. The encoder contains self-attention."
+    candidate = {
+        "source": "self-attention",
+        "relation": "PART_OF",
+        "target": "Transformer",
+    }
+
+    assert _approved_graph_edges(text, [candidate], [{"index": 0, "quote": text}]) == []
+
+
+def test_graph_without_candidate_edges_skips_verifier():
+    aot = make_aot()
+    aot["knowledge_graph"]["edges"] = []
+    llm = FakeLLM(aot=aot)
+    dag = FakeDAG()
+
+    ingest_document("ignored.md", FakeStore(), llm, dag, processor=FakeProcessor())
+
+    assert llm.verify_calls == []
+    assert dag.saved[0]["edges"] == []
+
+
+def test_graph_verifier_request_caps_candidates_conservatively():
+    aot = make_aot()
+    edge = aot["knowledge_graph"]["edges"][0]
+    aot["knowledge_graph"]["edges"] = [
+        dict(edge) for _ in range(MAX_GRAPH_VERIFIER_CANDIDATES + 1)
+    ]
+    llm = FakeLLM(aot=aot)
+    dag = FakeDAG()
+
+    ingest_document("ignored.md", FakeStore(), llm, dag, processor=FakeProcessor())
+
+    assert len(llm.verify_calls[0][1]) == MAX_GRAPH_VERIFIER_CANDIDATES
+    assert len(dag.saved[0]["edges"]) == MAX_GRAPH_VERIFIER_CANDIDATES
+
+
+def test_ingestion_keeps_thin_section_without_question_children():
+    store = FakeStore()
+
+    result = ingest_document(
+        "ignored.md", store, ThinSectionLLM(), FakeDAG(), processor=FakeProcessor()
+    )
+
+    assert result == expected_result(["lora.md::Method"], [])
+    assert [call[0] for call in store.calls] == ["delete", "curriculum", "questions"]
+    assert store.calls[-1][1] == []
+
+
 def test_empty_parse_fails_before_database_or_graph_mutation():
     empty_processor = FakeProcessor(
         sections=[], report={"retained_section_count": 0, "bibliography_omitted": False}
@@ -418,6 +646,57 @@ def test_failed_force_reingest_does_not_clean_stale_sections():
     assert obsolete_metadata not in dag.removed
 
 
+def test_stale_graph_cleanup_failure_keeps_parent_discoverable_for_retry():
+    obsolete_metadata = {
+        "source": "lora.md",
+        "section": "References",
+        "seq_id": 9,
+        "page_start": 10,
+        "page_end": 10,
+    }
+    obsolete_parent_id = make_parent_id(obsolete_metadata)
+    store = FakeStore()
+    store.previous_sections = [
+        {"metadata": {**obsolete_metadata, "parent_id": obsolete_parent_id}}
+    ]
+    dag = FailingStaleCleanupDAG(
+        obsolete_metadata["section"], store, obsolete_parent_id
+    )
+
+    with pytest.raises(RuntimeError, match="stale graph cleanup failed"):
+        ingest_document(
+            "ignored.md",
+            store,
+            FakeLLM(),
+            dag,
+            processor=FakeProcessor(),
+            force_reingest=True,
+        )
+
+    assert ("delete", obsolete_parent_id) not in store.calls
+
+    ingest_document(
+        "ignored.md",
+        store,
+        FakeLLM(),
+        dag,
+        processor=FakeProcessor(),
+        force_reingest=True,
+    )
+
+    stale_removals = [
+        metadata
+        for metadata in dag.removed
+        if metadata.get("section") == obsolete_metadata["section"]
+    ]
+    assert stale_removals == [
+        {**obsolete_metadata, "parent_id": obsolete_parent_id},
+        {**obsolete_metadata, "parent_id": obsolete_parent_id},
+    ]
+    assert store.get_section_calls == [("lora.md", ""), ("lora.md", "")]
+    assert store.calls[-1] == ("delete", obsolete_parent_id)
+
+
 def test_generation_calls_overlap_without_concurrent_section_persistence():
     llm = ConcurrentLLM()
     store = FakeStore()
@@ -430,6 +709,17 @@ def test_generation_calls_overlap_without_concurrent_section_persistence():
     assert [call[0] for call in store.calls] == ["delete", "curriculum", "questions"]
 
 
+def test_graph_verification_overlaps_questions_with_two_workers():
+    llm = ConcurrentVerifierLLM()
+
+    ingest_document(
+        "ignored.md", FakeStore(), llm, FakeDAG(), processor=FakeProcessor()
+    )
+
+    assert llm.questions_started.is_set()
+    assert llm.verifier_started.is_set()
+
+
 def test_generation_failure_writes_nothing_for_current_section():
     store = FakeStore()
     dag = FakeDAG()
@@ -437,6 +727,20 @@ def test_generation_failure_writes_nothing_for_current_section():
     with pytest.raises(RuntimeError, match="question generation failed"):
         ingest_document(
             "ignored.md", store, FailingQuestionsLLM(), dag, processor=FakeProcessor()
+        )
+
+    assert store.calls == []
+    assert dag.saved == []
+    assert dag.removed == []
+
+
+def test_graph_verification_failure_writes_nothing_for_current_section():
+    store = FakeStore()
+    dag = FakeDAG()
+
+    with pytest.raises(RuntimeError, match="graph verification failed"):
+        ingest_document(
+            "ignored.md", store, FailingVerifierLLM(), dag, processor=FakeProcessor()
         )
 
     assert store.calls == []

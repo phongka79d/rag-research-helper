@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from core.schemas import MAX_GRAPH_VERIFIER_CANDIDATES
 from database.document_processor import DocumentProcessor
 
 
@@ -53,6 +54,69 @@ def _normalized_phrase(value: Any) -> str:
 def _is_grounded_name(name: Any, normalized_section: str) -> bool:
     phrase = _normalized_phrase(name)
     return bool(phrase) and f" {phrase} " in f" {normalized_section} "
+
+
+def _evidence_term(value: str) -> str:
+    """Match a normalized endpoint without allowing it to absorb surrounding words."""
+    return rf"(?<!\w)(?:the )?{re.escape(_normalized_phrase(value))}(?!\w)"
+
+
+def _quote_supports_relation(
+    quote: str, source: str, relation: Any, target: str
+) -> bool:
+    """Fail closed unless the verifier quote directly asserts its proposed edge."""
+    source_term = _evidence_term(source)
+    target_term = _evidence_term(target)
+    relation_quote = _normalized_phrase(
+        re.sub(r"[.!?;:]+", " relationboundary ", quote)
+    )
+    if not relation_quote:
+        return False
+
+    def matches(patterns: list[str]) -> bool:
+        return any(re.search(pattern, relation_quote) for pattern in patterns)
+
+    normalized_relation = str(relation or "").strip().upper()
+    if normalized_relation == "PART_OF":
+        return matches(
+            [
+                rf"{source_term}\s+(?:is|are|was|were)\s+(?:an? |the |one of the )?"
+                rf"(?:component|part|layer|module|element|subcomponent)\s+(?:of|in|within)\s+{target_term}",
+                rf"{source_term}\s+(?:forms?|form)\s+(?:an? )?part\s+of\s+{target_term}",
+                rf"{target_term}\s+(?:contains|consists of|is composed of|comprises|includes)\s+{source_term}",
+            ]
+        )
+    if normalized_relation == "PREREQUISITE_OF":
+        return matches(
+            [
+                rf"(?:understanding|learning)(?:\s+of)?\s+{source_term}\s+(?:is\s+)?"
+                rf"(?:an?\s+)?(?:prerequisite|required|necessary)\s+(?:before|for)\s+"
+                rf"(?:understanding|learning)(?:\s+of)?\s+{target_term}",
+                rf"(?:understanding|learning)(?:\s+of)?\s+{target_term}\s+"
+                rf"(?:requires|needs)\s+(?:understanding|learning)(?:\s+of)?\s+{source_term}",
+                rf"before\s+(?:understanding|learning)(?:\s+of)?\s+{target_term}\s+"
+                rf"(?:one|you|we)\s+(?:must|need to)\s+(?:understand|learn)\s+{source_term}",
+            ]
+        )
+    if normalized_relation == "DESCRIBES":
+        return matches(
+            [
+                rf"{source_term}\s+(?:explains|defines|describes)\s+(?:how\s+)?{target_term}",
+                rf"{target_term}\s+(?:is|are)\s+(?:explained|defined|described)\s+by\s+{source_term}",
+            ]
+        )
+    if normalized_relation == "RELATES_TO":
+        return matches(
+            [
+                rf"{source_term}\s+(?:is|are|was|were)?\s*(?:directly\s+|closely\s+)?related\s+to\s+{target_term}",
+                rf"{target_term}\s+(?:is|are|was|were)?\s*(?:directly\s+|closely\s+)?related\s+to\s+{source_term}",
+                rf"{source_term}\s+and\s+{target_term}\s+(?:are|is)\s+related",
+                rf"{target_term}\s+and\s+{source_term}\s+(?:are|is)\s+related",
+                rf"(?:relationship|relation)\s+between\s+{source_term}\s+and\s+{target_term}",
+                rf"(?:relationship|relation)\s+between\s+{target_term}\s+and\s+{source_term}",
+            ]
+        )
+    return False
 
 
 def _grounded_names(values: Any, normalized_section: str) -> list[str]:
@@ -118,6 +182,73 @@ def filter_aot_to_section(aot: dict[str, Any], section_text: str) -> dict[str, A
         "learning_roadmap": roadmap,
         "knowledge_graph": {"nodes": nodes, "edges": edges},
     }
+
+
+def _approved_graph_edges(
+    section_text: str,
+    candidates: list[dict[str, Any]],
+    approvals: Any,
+) -> list[dict[str, Any]]:
+    """Keep only candidate edges approved with grounded source evidence."""
+    if not isinstance(approvals, list):
+        return []
+    normalized_section = _normalized_phrase(section_text)
+    accepted: list[dict[str, Any]] = []
+    index_counts: dict[int, int] = {}
+    for approval in approvals:
+        if not isinstance(approval, dict):
+            continue
+        index = approval.get("index")
+        if (
+            not isinstance(index, bool)
+            and isinstance(index, int)
+            and 0 <= index < len(candidates)
+        ):
+            index_counts[index] = index_counts.get(index, 0) + 1
+
+    for approval in approvals:
+        if not isinstance(approval, dict):
+            continue
+        index = approval.get("index")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= len(candidates)
+            or index_counts.get(index) != 1
+        ):
+            continue
+
+        candidate = candidates[index]
+        source = str(candidate.get("source", "")).strip()
+        target = str(candidate.get("target", "")).strip()
+        normalized_source = _normalized_phrase(source)
+        normalized_target = _normalized_phrase(target)
+        if (
+            not normalized_source
+            or normalized_source == normalized_target
+            or not _is_grounded_name(source, normalized_section)
+            or not _is_grounded_name(target, normalized_section)
+        ):
+            continue
+
+        quote = approval.get("quote")
+        if not isinstance(quote, str):
+            continue
+        normalized_quote = _normalized_phrase(quote)
+        padded_quote = f" {normalized_quote} "
+        if (
+            not normalized_quote
+            or padded_quote not in f" {normalized_section} "
+            or f" {normalized_source} " not in padded_quote
+            or f" {normalized_target} " not in padded_quote
+            or not _quote_supports_relation(
+                quote, source, candidate.get("relation"), target
+            )
+        ):
+            continue
+        accepted.append(candidate)
+    return accepted
 
 
 def _append_paper_nodes(existing_nodes: list[str], aot: dict[str, Any]) -> None:
@@ -206,10 +337,31 @@ def ingest_document(
                     llm.generate_hypothetical_questions,
                     full_text,
                     num_questions=5,
+                    section_title=metadata["section"],
                 )
                 aot = filter_aot_to_section(aot_future.result(), full_text)
+                graph = aot.get("knowledge_graph", {})
+                # Ponytail: omit surplus candidates rather than expanding the
+                # verifier request budget or persisting unverified edges.
+                candidate_edges = graph.get("edges", [])[:MAX_GRAPH_VERIFIER_CANDIDATES]
+                verification_future = (
+                    executor.submit(
+                        llm.verify_graph_edges,
+                        full_text,
+                        candidate_edges,
+                    )
+                    if candidate_edges
+                    else None
+                )
                 questions = questions_future.result()
-            graph = aot.get("knowledge_graph", {})
+                approvals = (
+                    verification_future.result()
+                    if verification_future is not None
+                    else []
+                )
+                graph["edges"] = _approved_graph_edges(
+                    full_text, candidate_edges, approvals
+                )
             nodes = graph.get("nodes", [])
             edges = graph.get("edges", [])
 
@@ -271,7 +423,7 @@ def ingest_document(
                 previous_metadata.get("source") == source
                 and previous_parent_id not in current_parent_ids
             ):
-                db.delete_parent(previous_parent_id)
                 dag.remove_source_locator(previous_metadata)
+                db.delete_parent(previous_parent_id)
 
     return {"ingested": ingested, "skipped": skipped, "report": report}

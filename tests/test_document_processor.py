@@ -118,6 +118,84 @@ def test_pdf_can_start_at_first_numbered_heading_without_an_abstract(monkeypatch
     }
 
 
+def test_punctuated_numbered_heading_can_start_pdf_body(monkeypatch, tmp_path):
+    install_pdf(
+        monkeypatch,
+        [
+            "Paper title\n"
+            "Authors\n"
+            "4 QLoRA vs. Standard Finetuning\n"
+            "Comparison text."
+        ],
+    )
+
+    sections = DocumentProcessor().process_pdf(tmp_path / "punctuated.pdf")
+
+    assert [section["metadata"]["section"] for section in sections] == [
+        "4 QLoRA vs. Standard Finetuning"
+    ]
+    assert sections[0]["page_content"] == "Comparison text."
+
+
+def test_formula_fragment_stays_content_while_real_heading_splits_section(
+    monkeypatch, tmp_path
+):
+    install_pdf(
+        monkeypatch,
+        [
+            "Abstract\n"
+            "Summary.\n"
+            "3 QLoRA Finetuning\n"
+            "YBF16 = XBF16 + XBF16 LBF16\n"
+            "1 LBF16\n"
+            "2 , (5)\n"
+            "4 QLoRA vs. Standard Finetuning\n"
+            "Comparison text."
+        ],
+    )
+
+    sections = DocumentProcessor().process_pdf(tmp_path / "formula.pdf")
+
+    assert [section["metadata"]["section"] for section in sections] == [
+        "Abstract",
+        "3 QLoRA Finetuning",
+        "4 QLoRA vs. Standard Finetuning",
+    ]
+    assert "1 LBF16" in sections[1]["page_content"]
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "2 Method",
+        "2 Method:",
+        "2 BERT",
+        "2 GPT-4",
+        "5.1 Experimental setup",
+        "III Discussion",
+        "III. Discussion",
+    ],
+)
+def test_supported_compact_numbered_headings_remain_eligible(heading):
+    assert DocumentProcessor._is_pdf_heading(heading)
+    assert DocumentProcessor._is_pdf_body_start(heading)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "1 LBF16",
+        "2014 English-French dataset details continue this section.",
+        "1 This is a numbered sentence.",
+        "2 Is this a numbered question?",
+        "3 This is a numbered exclamation!",
+    ],
+)
+def test_formula_year_and_sentence_lines_are_not_numbered_headings(line):
+    assert not DocumentProcessor._is_pdf_heading(line)
+    assert not DocumentProcessor._is_pdf_body_start(line)
+
+
 def test_four_digit_year_prose_remains_in_its_current_section(monkeypatch, tmp_path):
     install_pdf(
         monkeypatch,

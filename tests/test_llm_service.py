@@ -2,13 +2,16 @@ from types import SimpleNamespace
 
 import pytest
 from openai import OpenAIError
+from pydantic import ValidationError
 
 import orchestrator.llm_service as llm_service
 from orchestrator.llm_service import (
     ANSWER_MAX_OUTPUT_TOKENS,
+    GRAPH_VERIFIER_MAX_OUTPUT_TOKENS,
     TEACH_MAX_OUTPUT_TOKENS,
     LLMService,
 )
+from core.schemas import MAX_GRAPH_VERIFIER_CANDIDATES
 
 
 class FakeEmbeddings:
@@ -140,9 +143,211 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
         and call["text"] == {"format": {"type": "json_object"}}
         for call in service.client.responses.calls
     )
+    aot_prompt = service.client.responses.calls[0]["input"][1]["content"]
+    assert "earlier sections of this same paper" in aot_prompt
+    assert "must\n  occur in this current source section" in aot_prompt
+    assert "understanding A is required\n  before understanding B" in aot_prompt
+    assert "component, part, layer, module, or\n  element of B" in aot_prompt
+    assert "A explains, defines, or\n  describes B" in aot_prompt
+    assert "does not imply direction, precedence, or composition" in aot_prompt
+    assert "Usage, reliance, architectural basis, addition, application, possession, capability" in aot_prompt
+    assert "evaluated with or on B does not by itself make A and B PART_OF, PREREQUISITE_OF" in aot_prompt
+    assert "or RELATES_TO" in aot_prompt
+    assert '"System A uses technique B" does not support technique B\n  PART_OF System A' in aot_prompt
+    assert '"Technique B is a layer\n  of System A" supports that edge' in aot_prompt
+    assert "co-occurrence" in aot_prompt
+    assert "Do not emit self-loops" in aot_prompt
+    assert "mention order, section order, temporal order" in aot_prompt
+    assert "shared context, usage, or\n  evaluation" in aot_prompt
+    assert "models, datasets, or benchmarks" not in aot_prompt
+    assert "relabel an unsupported relation as RELATES_TO" in aot_prompt
+    assert "differs from an existing name only by letter case" in aot_prompt
+    assert "Do not merge names by removing whitespace or punctuation" in aot_prompt
+
+    qa_prompt = service.client.responses.calls[1]["input"][1]["content"]
+    assert "directly and completely answer its question" in qa_prompt
+    assert "numeric, count, list, or comparison questions" in qa_prompt
+    assert "including relevant units, scope, and conditions" in qa_prompt
+    assert "Generate up to 2 distinct hypothetical user questions" in qa_prompt
+    assert "Produce at most 2 distinct questions covering different facts or concepts" in qa_prompt
+    assert "Return zero pairs when the section lacks a directly answerable distinct question" in qa_prompt
+    assert "Do not infer an answer from another section" in qa_prompt
+    assert "Section heading context" not in qa_prompt
+
+
+def test_graph_verifier_uses_indexed_immutable_candidates_and_exact_quote_contract():
+    service = make_service()
+    service.client = FakeClient(
+        response_texts=[
+            '{"approvals":[{"index":1,"quote":"A is a component of B."}]}'
+        ]
+    )
+    candidates = [
+        {"source": "B", "relation": "PART_OF", "target": "A"},
+        {"source": "A", "relation": "PART_OF", "target": "B"},
+    ]
+    original_candidates = [dict(candidate) for candidate in candidates]
+
+    assert service.verify_graph_edges(
+        "A is a component of B.", candidates
+    ) == [{"index": 1, "quote": "A is a component of B."}]
+    assert candidates == original_candidates
+
+    request = service.client.responses.calls[0]
+    assert request["model"] == "test-chat"
+    assert request["max_output_tokens"] == GRAPH_VERIFIER_MAX_OUTPUT_TOKENS
+    assert request["text"] == {"format": {"type": "json_object"}}
+    assert "reasoning" not in request
+    prompt = request["input"][1]["content"]
+    assert '"index": 0, "source": "B", "relation": "PART_OF", "target": "A"' in prompt
+    assert '"index": 1, "source": "A", "relation": "PART_OF", "target": "B"' in prompt
+    assert "short contiguous quote copied exactly from the source" in prompt
+    assert f"At most {MAX_GRAPH_VERIFIER_CANDIDATES} candidates are supplied" in prompt
+    assert "at most 500 characters" in prompt
+    assert "understanding A is required\n  before understanding B" in prompt
+    assert "component, part, layer, module, or element" in prompt
+    assert "A explains, defines, or describes B" in prompt
+    assert "does not\n  imply precedence, composition, or direction" in prompt
+    assert "Usage, reliance, architectural basis, addition, application, possession, capability" in prompt
+    assert "does not by\n  itself support any candidate relation, including RELATES_TO" in prompt
+    assert 'candidate technique B PART_OF System A with quote "System A\n  uses technique B." MUST be omitted' in prompt
+    assert '"Technique B is a layer of System A." MAY be approved' in prompt
+    assert "MUST be copied verbatim from the source section, never paraphrased" in prompt
+    assert "Never add an edge" in prompt
+    assert "change an\n  endpoint or relation, reverse direction" in prompt
+
+
+def test_graph_verifier_skips_provider_call_without_candidates():
+    service = make_service()
+    service.client = FakeClient()
+
+    assert service.verify_graph_edges("No candidate relation.", []) == []
+    assert service.client.responses.calls == []
+
+
+def test_graph_verifier_bounds_its_candidate_payload():
+    service = make_service()
+    candidates = [
+        {"source": "A", "relation": "RELATES_TO", "target": "B"}
+        for _ in range(MAX_GRAPH_VERIFIER_CANDIDATES + 1)
+    ]
+    service.client = FakeClient(response_texts=['{"approvals":[]}'])
+
+    assert service.verify_graph_edges("A relates to B.", candidates) == []
+
     prompt = service.client.responses.calls[0]["input"][1]["content"]
-    assert "earlier sections of this same paper" in prompt
-    assert "must\n  occur in this current source section" in prompt
+    assert f'"index": {MAX_GRAPH_VERIFIER_CANDIDATES - 1}' in prompt
+    assert f'"index": {MAX_GRAPH_VERIFIER_CANDIDATES}' not in prompt
+
+
+@pytest.mark.parametrize(
+    "response_text",
+    [
+        "{}",
+        '{"approvals":[{"index":"zero","quote":"A supports B."}]}',
+        '{"approvals":[{"index":0,"quote":"A supports B.","relation":"RELATES_TO"}]}',
+    ],
+)
+def test_graph_verifier_rejects_invalid_structural_responses(response_text):
+    service = make_service()
+    service.client = FakeClient(response_texts=[response_text])
+
+    with pytest.raises(ValidationError):
+        service.verify_graph_edges(
+            "A supports B.",
+            [{"source": "A", "relation": "RELATES_TO", "target": "B"}],
+        )
+
+    assert len(service.client.responses.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("response_text", "expected"),
+    [
+        ('{"qa_pairs":[]}', []),
+        (
+            '{"qa_pairs":[{"question":"What is LoRA?","key_knowledge":"An adaptation method."}]}',
+            [{"question": "What is LoRA?", "key_knowledge": "An adaptation method."}],
+        ),
+    ],
+)
+def test_hypothetical_questions_allow_zero_to_requested_max(response_text, expected):
+    service = make_service()
+    service.client = FakeClient(response_texts=[response_text])
+
+    assert service.generate_hypothetical_questions("LoRA adapts a model.", 2) == expected
+
+    assert len(service.client.responses.calls) == 1
+
+
+def test_hypothetical_questions_adds_grounded_title_context_only_when_supplied():
+    service = make_service()
+    service.client = FakeClient(
+        response_texts=[
+            '{"qa_pairs":[{"question":"What does the conversion algorithm do?",'
+            '"key_knowledge":"It converts an LLM-based agent into an SLM-based agent."}]}'
+        ]
+    )
+
+    assert service.generate_hypothetical_questions(
+        "The algorithm converts an LLM-based agent into an SLM-based agent.",
+        2,
+        section_title="LLM-to-SLM Agent Conversion Algorithm",
+    ) == [
+        {
+            "question": "What does the conversion algorithm do?",
+            "key_knowledge": "It converts an LLM-based agent into an SLM-based agent.",
+        }
+    ]
+
+    prompt = service.client.responses.calls[0]["input"][1]["content"]
+    assert '"LLM-to-SLM Agent Conversion Algorithm"' in prompt
+    assert "Section heading context (not evidence)" in prompt
+    assert "include at most one distinct overview QA" in prompt
+    assert "The raw source section is the only evidence" in prompt
+    assert "do not create an\noverview QA from the heading alone" in prompt
+    assert "do not exceed the requested total" in prompt
+    assert "Every other\npair must cover a different source-supported detail" in prompt
+    assert "do not restate the heading topic in\nmultiple overview questions" in prompt
+
+
+def test_hypothetical_questions_reject_more_than_requested_max():
+    service = make_service()
+    service.client = FakeClient(
+        response_texts=[
+            '{"qa_pairs":[{"question":"One?","key_knowledge":"One."},'
+            '{"question":"Two?","key_knowledge":"Two."},'
+            '{"question":"Three?","key_knowledge":"Three."}]}'
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="returned 3 hypothetical questions; maximum is 2"):
+        service.generate_hypothetical_questions("LoRA adapts a model.", 2)
+
+
+@pytest.mark.parametrize("response_text", ["{}", '{"qa_pairs":"not a list"}'])
+def test_hypothetical_questions_require_a_pairs_array(response_text):
+    service = make_service()
+    service.client = FakeClient(response_texts=[response_text])
+
+    with pytest.raises(RuntimeError, match="qa_pairs as a JSON array"):
+        service.generate_hypothetical_questions("LoRA adapts a model.", 2)
+
+
+def test_hypothetical_questions_drop_duplicate_question_text():
+    service = make_service()
+    service.client = FakeClient(
+        response_texts=[
+            '{"qa_pairs":[{"question":"What is LoRA?","key_knowledge":"An adaptation method."},'
+            '{"question":"what is lora","key_knowledge":"Repeated answer."},'
+            '{"question":"What stays frozen?","key_knowledge":"Base weights."}]}'
+        ]
+    )
+
+    assert service.generate_hypothetical_questions("LoRA adapts a model.", 3) == [
+        {"question": "What is LoRA?", "key_knowledge": "An adaptation method."},
+        {"question": "What stays frozen?", "key_knowledge": "Base weights."},
+    ]
 
 
 def test_rerank_filters_unknown_ids_and_preserves_fallback():

@@ -58,7 +58,7 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 1. The sidebar in `main.py` saves the uploaded file under `data/papers/`.
 2. `DocumentProcessor` splits PDF or Markdown content into ordered sections with source, section, page, and sequence metadata.
 3. `ingest_document()` in `core/data_ingestion.py` asks `LLMService` for an AOT result: main concepts, a learning roadmap, and a small knowledge graph.
-4. The graph is stored in Neo4j; roadmap steps and full parent sections are stored in `research_curriculum`; exactly five hypothetical question children are stored in `research_questions`.
+4. The graph is stored in Neo4j; roadmap steps and full parent sections are stored in `research_curriculum`; up to five directly answerable hypothetical question children are stored in `research_questions` (thin sections may have none).
 5. Each child question keeps its `parent_id`, so retrieval can resolve the complete original section.
 
 ### 3. Ask a paper question
@@ -208,7 +208,7 @@ The evaluation requires reachable Qdrant and Neo4j services, a configured OpenAI
 - Preserve the direct flow: `RuntimeEngine` calls Qdrant, Neo4j, and `LLMService` directly. Do not introduce repositories, services, adapters, factories, dependency injection, LangChain, or LangGraph.
 - Keep JSON-producing compatible-provider calls in `LLMService` in JSON mode. The rerank call has a bounded token allowance so it can return its required JSON selection.
 - Keep `.env` private. Before any Neo4j-dependent change, verify the existing database safely; never delete/reset data or volumes automatically.
-- When changing ingestion, coordinate `core/data_ingestion.py`, `database/structural_db.py`, `database/semantic_dag.py`, and their focused tests. Preserve the parent-child `parent_id` contract and exactly five stored hypothetical questions per section.
+- When changing ingestion, coordinate `core/data_ingestion.py`, `database/structural_db.py`, `database/semantic_dag.py`, and their focused tests. Preserve the parent-child `parent_id` contract and up to five stored hypothetical questions per section.
 - When changing retrieval behavior, validate `tests/test_qdrant.py`, `tests/test_runtime.py`, and `evaluate.py`; test a real Ask path when configured services are available.
 - Ignore generated caches such as `__pycache__/` and `.pytest_cache/`. Treat `eval_results.json` as a generated evaluation artifact.
 

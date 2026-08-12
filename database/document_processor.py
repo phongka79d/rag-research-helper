@@ -10,10 +10,12 @@ from pypdf import PdfReader
 
 MARKDOWN_HEADING = re.compile(r"^(#{1,2})\s+(.+?)\s*#*\s*$")
 NUMBERED_HEADING = re.compile(
-    r"^(?:(?:\d+(?:\.\d+)*)|(?:[IVXLC]+))[.)]?\s+[A-Z][A-Za-z0-9 ,:;()/_-]{1,100}$"
+    r"^(?:(?:\d+(?:\.\d+)*)|(?:[IVXLC]+))[.)]?\s+"
+    r"(?P<title>[A-Z][A-Za-z0-9 .,:;()/_-]{1,100})$"
 )
 FOUR_DIGIT_YEAR_PREFIX = re.compile(r"^\d{4}\b")
 SECTION_PREFIX = re.compile(r"^(?:(?:\d+(?:\.\d+)*)|(?:[IVXLC]+))[.)]?\s+", re.IGNORECASE)
+FORMULA_LIKE_TITLE = re.compile(r"^[A-Z]+\d+$")
 COMMON_PAPER_HEADINGS = {
     "abstract",
     "introduction",
@@ -165,20 +167,25 @@ class DocumentProcessor:
 
     @staticmethod
     def _is_pdf_heading(line: str) -> bool:
-        if FOUR_DIGIT_YEAR_PREFIX.match(line):
-            return False
         normalized = line.lower().rstrip(":")
         if normalized in COMMON_PAPER_HEADINGS:
             return True
-        return bool(NUMBERED_HEADING.match(line))
+        return DocumentProcessor._is_numbered_heading(line)
+
+    @staticmethod
+    def _is_numbered_heading(line: str) -> bool:
+        if FOUR_DIGIT_YEAR_PREFIX.match(line) or line.endswith((".", "?", "!")):
+            return False
+        match = NUMBERED_HEADING.match(line)
+        if not match:
+            return False
+        title = match.group("title").rstrip(":")
+        return not FORMULA_LIKE_TITLE.fullmatch(title)
 
     @staticmethod
     def _is_pdf_body_start(line: str) -> bool:
         normalized = line.lower().rstrip(":")
-        return normalized == "abstract" or (
-            not FOUR_DIGIT_YEAR_PREFIX.match(line)
-            and bool(NUMBERED_HEADING.match(line))
-        )
+        return normalized == "abstract" or DocumentProcessor._is_numbered_heading(line)
 
     @staticmethod
     def _is_references_heading(line: str) -> bool:
