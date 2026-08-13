@@ -44,6 +44,37 @@ class GraphEdgeVerificationResult(BaseModel):
     )
 
 
+class GraphEvidenceEdge(BaseModel):
+    """A strict graph-only recovery candidate with its quoted source evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1, strict=True)
+    relation: str = Field(strict=True)
+    target: str = Field(min_length=1, strict=True)
+    quote: str = Field(min_length=1, max_length=500, strict=True)
+
+    @field_validator("relation")
+    @classmethod
+    def require_known_relation(cls, relation: str) -> str:
+        normalized = relation.strip().upper().replace(" ", "_")
+        # Graph-only recovery is deliberately narrower than the main AOT graph:
+        # it exists to recover explicit whole-part wording after the normal pass
+        # produced no retained edge.  Other relations still use the existing
+        # verifier path and must not enter this recovery payload.
+        if normalized != "PART_OF":
+            raise ValueError("graph recovery supports PART_OF edges only.")
+        return normalized
+
+
+class GraphEvidenceResult(BaseModel):
+    """Validated bounded payload returned by the graph-only recovery request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    edges: list[GraphEvidenceEdge] = Field(max_length=MAX_GRAPH_VERIFIER_CANDIDATES)
+
+
 class KnowledgeGraph(BaseModel):
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)

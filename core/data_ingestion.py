@@ -14,6 +14,12 @@ from database.document_processor import DocumentProcessor
 
 
 _NON_ALPHANUMERIC = re.compile(r"[\W_]+", re.UNICODE)
+_DIRECT_WHOLE_PART_CUE = re.compile(
+    r"(?:consists\s+of|is\s+composed\s+of|"
+    r"is\s+made\s+up\s+of|is\s+(?:an?\s+|the\s+)?(?:component|part|layer|"
+    r"module|element)\s+(?:of|in|within)|forms?\s+(?:an?\s+)?part\s+of)\b",
+    re.IGNORECASE,
+)
 
 
 def make_parent_id(metadata: dict[str, Any]) -> str:
@@ -58,7 +64,7 @@ def _is_grounded_name(name: Any, normalized_section: str) -> bool:
 
 def _evidence_term(value: str) -> str:
     """Match a normalized endpoint without allowing it to absorb surrounding words."""
-    return rf"(?<!\w)(?:the )?{re.escape(_normalized_phrase(value))}(?!\w)"
+    return rf"(?<!\w)(?:an? |the )?{re.escape(_normalized_phrase(value))}(?!\w)"
 
 
 def _quote_supports_relation(
@@ -78,12 +84,14 @@ def _quote_supports_relation(
 
     normalized_relation = str(relation or "").strip().upper()
     if normalized_relation == "PART_OF":
+        optional_article = r"(?:an?\s+|the\s+)?"
         return matches(
             [
                 rf"{source_term}\s+(?:is|are|was|were)\s+(?:an? |the |one of the )?"
-                rf"(?:component|part|layer|module|element|subcomponent)\s+(?:of|in|within)\s+{target_term}",
+                rf"(?:components?|parts?|layers?|modules?|elements?|subcomponents?)\s+(?:of|in|within)\s+{target_term}",
                 rf"{source_term}\s+(?:forms?|form)\s+(?:an? )?part\s+of\s+{target_term}",
-                rf"{target_term}\s+(?:contains|consists of|is composed of|comprises|includes)\s+{source_term}",
+                rf"{target_term}\s+(?:contains|includes|comprises)\s+{optional_article}{source_term}",
+                rf"{target_term}\s+(?:consists\s+of|is\s+composed\s+of|is\s+made\s+up\s+of)\s+{optional_article}{source_term}",
             ]
         )
     if normalized_relation == "PREREQUISITE_OF":
@@ -251,6 +259,80 @@ def _approved_graph_edges(
     return accepted
 
 
+def _verifier_approval_count(candidates: list[dict[str, Any]], approvals: Any) -> int:
+    """Count structurally valid verifier decisions before the local evidence gate."""
+    if not isinstance(approvals, list):
+        return 0
+    indexes: set[int] = set()
+    duplicates: set[int] = set()
+    for approval in approvals:
+        if not isinstance(approval, dict):
+            continue
+        index = approval.get("index")
+        quote = approval.get("quote")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(candidates)
+            or not isinstance(quote, str)
+            or not quote.strip()
+        ):
+            continue
+        if index in indexes:
+            duplicates.add(index)
+        else:
+            indexes.add(index)
+    return len(indexes - duplicates)
+
+
+def _has_direct_whole_part_cue(section_text: str) -> bool:
+    """Limit recovery calls to explicit whole-part phrasing, never generic usage."""
+    normalized = _normalized_phrase(section_text)
+    return bool(_DIRECT_WHOLE_PART_CUE.search(normalized))
+
+
+def _recovery_candidates(
+    section_text: str, raw_edges: Any
+) -> list[dict[str, str]]:
+    """Keep only grounded fallback candidates whose supplied quote fits the local gate."""
+    if not isinstance(raw_edges, list):
+        return []
+    normalized_section = _normalized_phrase(section_text)
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw_edge in raw_edges[:MAX_GRAPH_VERIFIER_CANDIDATES]:
+        if not isinstance(raw_edge, dict):
+            continue
+        source = str(raw_edge.get("source", "")).strip()
+        relation = str(raw_edge.get("relation", "")).strip().upper()
+        target = str(raw_edge.get("target", "")).strip()
+        quote = raw_edge.get("quote")
+        key = (_normalized_phrase(source), relation, _normalized_phrase(target))
+        if (
+            not source
+            or not target
+            or not isinstance(quote, str)
+            or relation != "PART_OF"
+            or key in seen
+            or key[0] == key[2]
+            or not _is_grounded_name(source, normalized_section)
+            or not _is_grounded_name(target, normalized_section)
+            or not _quote_supports_relation(quote, source, relation, target)
+        ):
+            continue
+        normalized_quote = _normalized_phrase(quote)
+        if (
+            not normalized_quote
+            or f" {normalized_quote} " not in f" {normalized_section} "
+        ):
+            continue
+        seen.add(key)
+        candidates.append(
+            {"source": source, "relation": relation, "target": target}
+        )
+    return candidates
+
+
 def _append_paper_nodes(existing_nodes: list[str], aot: dict[str, Any]) -> None:
     """Reuse only terms accepted from earlier sections of this same paper."""
     known = {_normalized_phrase(name) for name in existing_nodes}
@@ -301,6 +383,11 @@ def ingest_document(
     existing_nodes: list[str] = []
     ingested: list[str] = []
     skipped: list[str] = []
+    graph_relationships = {
+        "candidates": 0,
+        "verifier_approvals": 0,
+        "retained": 0,
+    }
     total = len(sections)
     completed = 0
     source = str(sections[0]["metadata"].get("source", ""))
@@ -344,6 +431,7 @@ def ingest_document(
                 # Ponytail: omit surplus candidates rather than expanding the
                 # verifier request budget or persisting unverified edges.
                 candidate_edges = graph.get("edges", [])[:MAX_GRAPH_VERIFIER_CANDIDATES]
+                graph_relationships["candidates"] += len(candidate_edges)
                 verification_future = (
                     executor.submit(
                         llm.verify_graph_edges,
@@ -359,9 +447,44 @@ def ingest_document(
                     if verification_future is not None
                     else []
                 )
+                graph_relationships["verifier_approvals"] += _verifier_approval_count(
+                    candidate_edges, approvals
+                )
                 graph["edges"] = _approved_graph_edges(
                     full_text, candidate_edges, approvals
                 )
+
+                recovery = getattr(llm, "extract_graph_edges_with_evidence", None)
+                if (
+                    not graph["edges"]
+                    and _has_direct_whole_part_cue(full_text)
+                    and callable(recovery)
+                ):
+                    try:
+                        recovered_candidates = _recovery_candidates(
+                            full_text,
+                            recovery(full_text, existing_nodes=list(existing_nodes)),
+                        )
+                    except Exception:
+                        # Ponytail: a best-effort recovery must not replace a valid section.
+                        recovered_candidates = []
+                    if recovered_candidates:
+                        graph_relationships["candidates"] += len(recovered_candidates)
+                        try:
+                            recovered_approvals = llm.verify_graph_edges(
+                                full_text, recovered_candidates
+                            )
+                            graph_relationships["verifier_approvals"] += _verifier_approval_count(
+                                recovered_candidates, recovered_approvals
+                            )
+                            graph["edges"] = _approved_graph_edges(
+                                full_text, recovered_candidates, recovered_approvals
+                            )
+                        except Exception:
+                            # Ponytail: recovery verification is optional; fail closed
+                            # for this section while allowing the document to finish.
+                            graph["edges"] = []
+                graph_relationships["retained"] += len(graph["edges"])
             nodes = graph.get("nodes", [])
             edges = graph.get("edges", [])
 
@@ -426,4 +549,9 @@ def ingest_document(
                 dag.remove_source_locator(previous_metadata)
                 db.delete_parent(previous_parent_id)
 
-    return {"ingested": ingested, "skipped": skipped, "report": report}
+    return {
+        "ingested": ingested,
+        "skipped": skipped,
+        "report": report,
+        "graph_relationships": graph_relationships,
+    }

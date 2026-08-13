@@ -58,10 +58,22 @@ def build_ingestion_summary(
         if isinstance(report, dict)
         else False
     )
+    graph_relationships = result.get("graph_relationships", {})
+    relationship_counts = (
+        {
+            key: max(int(graph_relationships.get(key, 0)), 0)
+            for key in ("candidates", "verifier_approvals", "retained")
+        }
+        if isinstance(graph_relationships, dict)
+        else {"candidates": 0, "verifier_approvals": 0, "retained": 0}
+    )
     return {
         "compiled": len(result["ingested"]),
         "up_to_date": len(result["skipped"]),
         "bibliography_omitted": bibliography_omitted,
+        "candidate_relationships": relationship_counts["candidates"],
+        "approved_relationships": relationship_counts["verifier_approvals"],
+        "retained_relationships": relationship_counts["retained"],
         "elapsed_seconds": elapsed_seconds,
     }
 
@@ -90,6 +102,10 @@ def main() -> None:
             st.success(
                 "Compiled "
                 f"{summary['compiled']}; already up to date {summary['up_to_date']}; "
+                "relationships — "
+                f"candidates: {summary['candidate_relationships']}; "
+                f"verifier-approved: {summary['approved_relationships']}; "
+                f"retained: {summary['retained_relationships']}; "
                 f"bibliography omitted: {bibliography_status}; "
                 f"elapsed: {summary['elapsed_seconds']:.1f}s."
             )

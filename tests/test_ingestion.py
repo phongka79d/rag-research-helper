@@ -4,6 +4,7 @@ import pytest
 
 from core.data_ingestion import (
     _approved_graph_edges,
+    _has_direct_whole_part_cue,
     collect_anchor_nodes,
     filter_aot_to_section,
     ingest_document,
@@ -161,6 +162,26 @@ class FailingVerifierLLM(FakeLLM):
         raise RuntimeError("graph verification failed")
 
 
+class RecoveryLLM(FakeLLM):
+    def __init__(self, *args, recovered_edges=None, recovery_error=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.recovered_edges = recovered_edges or []
+        self.recovery_error = recovery_error
+        self.recovery_calls = []
+
+    def extract_graph_edges_with_evidence(self, text, existing_nodes):
+        self.recovery_calls.append((text, list(existing_nodes)))
+        if self.recovery_error is not None:
+            raise self.recovery_error
+        return self.recovered_edges
+
+
+class RecoveryVerifierFailureLLM(RecoveryLLM):
+    def verify_graph_edges(self, section_text, candidates):
+        self.verify_calls.append((section_text, candidates))
+        raise RuntimeError("recovery verification failed")
+
+
 class ConcurrentVerifierLLM(FakeLLM):
     def __init__(self):
         super().__init__()
@@ -248,11 +269,20 @@ class FakeStore:
             raise RuntimeError("question persistence failed")
 
 
-def expected_result(ingested: list[str], skipped: list[str]) -> dict:
+def expected_result(
+    ingested: list[str], skipped: list[str], graph_relationships: dict | None = None
+) -> dict:
+    if graph_relationships is None:
+        graph_relationships = {
+            "candidates": int(bool(ingested)),
+            "verifier_approvals": int(bool(ingested)),
+            "retained": int(bool(ingested)),
+        }
     return {
         "ingested": ingested,
         "skipped": skipped,
         "report": {"retained_section_count": 1, "bibliography_omitted": False},
+        "graph_relationships": graph_relationships,
     }
 
 
@@ -529,16 +559,246 @@ def test_graph_quote_gate_binds_whole_part_evidence_to_candidate_endpoints():
     assert _approved_graph_edges(text, [candidate], [{"index": 0, "quote": text}]) == []
 
 
+@pytest.mark.parametrize(
+    ("text", "candidate"),
+    [
+        (
+            "Each of the layers in our encoder and decoder contains a fully connected feed-forward network.",
+            {
+                "source": "fully connected feed-forward network",
+                "relation": "PART_OF",
+                "target": "layers in our encoder and decoder",
+            },
+        ),
+        (
+            "The encoder is composed of a stack of N identical layers.",
+            {
+                "source": "a stack of N identical layers",
+                "relation": "PART_OF",
+                "target": "encoder",
+            },
+        ),
+        (
+            "The model consists of an encoder and a decoder.",
+            {"source": "encoder", "relation": "PART_OF", "target": "model"},
+        ),
+    ],
+)
+def test_graph_quote_gate_keeps_natural_direct_whole_part_evidence(text, candidate):
+    assert _approved_graph_edges(text, [candidate], [{"index": 0, "quote": text}]) == [
+        candidate
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("The encoder is composed of a stack.", True),
+        ("The encoder consists of a stack.", True),
+        ("The encoder is made up of a stack.", True),
+        ("The stack is a component of the encoder.", True),
+        ("The stack forms part of the encoder.", True),
+        ("The model includes an encoder and a decoder.", False),
+        ("The model contains an encoder and a decoder.", False),
+        ("The model comprises an encoder and a decoder.", False),
+        ("The dataset includes adapters at every layer.", False),
+        ("The model contains no recurrence.", False),
+        ("The system uses a technique.", False),
+    ],
+)
+def test_graph_recovery_trigger_requires_non_negated_direct_whole_part_cue(
+    text, expected
+):
+    assert _has_direct_whole_part_cue(text) is expected
+
+
+def test_graph_recovery_reverifies_a_direct_cue_when_normal_aot_keeps_no_edge():
+    text = "The encoder is composed of a stack."
+    aot = {
+        "main_entities": ["encoder", "stack"],
+        "learning_roadmap": [],
+        "knowledge_graph": {
+            "nodes": [{"name": "encoder"}, {"name": "stack"}],
+            "edges": [],
+        },
+    }
+    llm = RecoveryLLM(
+        aot=aot,
+        recovered_edges=[
+            {
+                "source": "stack",
+                "relation": "PART_OF",
+                "target": "encoder",
+                "quote": text,
+            }
+        ],
+    )
+    dag = FakeDAG()
+
+    result = ingest_document(
+        "ignored.md",
+        FakeStore(),
+        llm,
+        dag,
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert len(llm.recovery_calls) == 1
+    assert llm.verify_calls == [(text, [{"source": "stack", "relation": "PART_OF", "target": "encoder"}])]
+    assert dag.saved[0]["edges"] == [
+        {"source": "stack", "relation": "PART_OF", "target": "encoder"}
+    ]
+    assert result["graph_relationships"] == {
+        "candidates": 1,
+        "verifier_approvals": 1,
+        "retained": 1,
+    }
+
+
+def test_graph_recovery_is_not_called_for_usage_or_after_a_normal_edge():
+    usage_aot = {
+        "main_entities": ["system", "technique"],
+        "learning_roadmap": [],
+        "knowledge_graph": {"nodes": [], "edges": []},
+    }
+    usage_llm = RecoveryLLM(aot=usage_aot)
+    ingest_document(
+        "ignored.md",
+        FakeStore(),
+        usage_llm,
+        FakeDAG(),
+        processor=FakeProcessor(sections=[make_section(text="The system uses a technique.")]),
+    )
+
+    retained_llm = RecoveryLLM()
+    ingest_document("ignored.md", FakeStore(), retained_llm, FakeDAG(), processor=FakeProcessor())
+
+    assert usage_llm.recovery_calls == []
+    assert retained_llm.recovery_calls == []
+
+
+def test_graph_recovery_rejects_its_own_bad_evidence_and_does_not_fail_ingestion():
+    text = "The encoder is composed of a stack."
+    aot = {
+        "main_entities": ["encoder", "stack"],
+        "learning_roadmap": [],
+        "knowledge_graph": {"nodes": [], "edges": []},
+    }
+    llm = RecoveryLLM(
+        aot=aot,
+        recovered_edges=[
+            {
+                "source": "stack",
+                "relation": "PART_OF",
+                "target": "encoder",
+                "quote": "The encoder uses a stack.",
+            }
+        ],
+    )
+    dag = FakeDAG()
+
+    result = ingest_document(
+        "ignored.md",
+        FakeStore(),
+        llm,
+        dag,
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert len(llm.recovery_calls) == 1
+    assert llm.verify_calls == []
+    assert dag.saved[0]["edges"] == []
+    assert result["graph_relationships"] == {
+        "candidates": 0,
+        "verifier_approvals": 0,
+        "retained": 0,
+    }
+
+
+def test_graph_recovery_verifier_failure_is_non_fatal_and_fails_closed():
+    text = "The encoder is composed of a stack."
+    llm = RecoveryVerifierFailureLLM(
+        aot={
+            "main_entities": ["encoder", "stack"],
+            "learning_roadmap": [],
+            "knowledge_graph": {"nodes": [], "edges": []},
+        },
+        recovered_edges=[
+            {
+                "source": "stack",
+                "relation": "PART_OF",
+                "target": "encoder",
+                "quote": text,
+            }
+        ],
+    )
+
+    result = ingest_document(
+        "ignored.md",
+        FakeStore(),
+        llm,
+        FakeDAG(),
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert len(llm.recovery_calls) == 1
+    assert len(llm.verify_calls) == 1
+    assert result["graph_relationships"] == {
+        "candidates": 1,
+        "verifier_approvals": 0,
+        "retained": 0,
+    }
+
+
 def test_graph_without_candidate_edges_skips_verifier():
     aot = make_aot()
     aot["knowledge_graph"]["edges"] = []
     llm = FakeLLM(aot=aot)
     dag = FakeDAG()
 
-    ingest_document("ignored.md", FakeStore(), llm, dag, processor=FakeProcessor())
+    result = ingest_document("ignored.md", FakeStore(), llm, dag, processor=FakeProcessor())
 
     assert llm.verify_calls == []
     assert dag.saved[0]["edges"] == []
+    assert result["graph_relationships"] == {
+        "candidates": 0,
+        "verifier_approvals": 0,
+        "retained": 0,
+    }
+
+
+def test_ingestion_reports_graph_candidate_approval_and_retained_counts():
+    text = "Alpha is part of Beta. Gamma uses Delta."
+    aot = {
+        "main_entities": ["Alpha", "Beta", "Gamma", "Delta"],
+        "learning_roadmap": [],
+        "knowledge_graph": {
+            "nodes": [{"name": name} for name in ("Alpha", "Beta", "Gamma", "Delta")],
+            "edges": [
+                {"source": "Alpha", "relation": "PART_OF", "target": "Beta"},
+                {"source": "Delta", "relation": "PART_OF", "target": "Gamma"},
+            ],
+        },
+    }
+    result = ingest_document(
+        "ignored.md",
+        FakeStore(),
+        FakeLLM(
+            aot=aot,
+            edge_approvals=[
+                {"index": 0, "quote": "Alpha is part of Beta."},
+                {"index": 1, "quote": "Gamma uses Delta."},
+            ],
+        ),
+        FakeDAG(),
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert result["graph_relationships"] == {
+        "candidates": 2,
+        "verifier_approvals": 2,
+        "retained": 1,
+    }
 
 
 def test_graph_verifier_request_caps_candidates_conservatively():

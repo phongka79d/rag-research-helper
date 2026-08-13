@@ -1,5 +1,5 @@
 {
-  "question_count": 28,
+  "question_count": 36,
   "categories": [
     "conceptual",
     "cross-paper",
@@ -8,19 +8,19 @@
     "relational"
   ],
   "parent_section_vector_baseline": {
-    "recall_at_5": 0.2857142857142857,
-    "mrr": 0.23809523809523808
+    "recall_at_5": 0.9722222222222222,
+    "mrr": 0.7972222222222223
   },
   "hyde_question_rerank": {
-    "recall_at_2": 0.2857142857142857,
-    "mrr": 0.25,
-    "all_expected_sources_rate": 0.2857142857142857,
-    "average_retrieval_latency_seconds": 1.8759715035890363,
+    "recall_at_2": 0.6527777777777778,
+    "mrr": 0.625,
+    "all_expected_sources_rate": 0.9166666666666666,
+    "average_retrieval_latency_seconds": 2.671614930551085,
     "rerank_source_rate": {
-      "jina": 0.5,
-      "llm_fallback": 0.39285714285714285,
+      "jina": 0.4722222222222222,
+      "llm_fallback": 0.4722222222222222,
       "llm": 0.0,
-      "vector": 0.10714285714285714
+      "vector": 0.05555555555555555
     },
     "effective_retrieval_limits": {
       "qdrant_search_limit": 25,
@@ -29,16 +29,16 @@
     }
   },
   "hyde_question_rerank_graph_context": {
-    "recall_at_2": 0.2857142857142857,
-    "mrr": 0.25,
-    "all_expected_sources_rate": 0.2857142857142857,
-    "average_retrieval_latency_seconds": 1.8759715035890363,
-    "average_graph_edges": 0.21428571428571427,
+    "recall_at_2": 0.6527777777777778,
+    "mrr": 0.625,
+    "all_expected_sources_rate": 0.9166666666666666,
+    "average_retrieval_latency_seconds": 2.671614930551085,
+    "average_graph_edges": 0.4444444444444444,
     "rerank_source_rate": {
-      "jina": 0.5,
-      "llm_fallback": 0.39285714285714285,
+      "jina": 0.4722222222222222,
+      "llm_fallback": 0.4722222222222222,
       "llm": 0.0,
-      "vector": 0.10714285714285714
+      "vector": 0.05555555555555555
     },
     "effective_retrieval_limits": {
       "qdrant_search_limit": 25,

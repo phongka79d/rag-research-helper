@@ -5,6 +5,7 @@ from openai import OpenAIError
 from pydantic import ValidationError
 
 import orchestrator.llm_service as llm_service
+from config.settings import Settings
 from orchestrator.llm_service import (
     ANSWER_MAX_OUTPUT_TOKENS,
     GRAPH_VERIFIER_MAX_OUTPUT_TOKENS,
@@ -51,6 +52,20 @@ def make_service():
             OPENAI_EMBEDDING_MODEL="test-embedding",
         )
     )
+
+
+class FakeHTTPResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.body.encode("utf-8")
 
 
 def test_client_uses_configured_compatible_endpoint_and_models(monkeypatch):
@@ -148,6 +163,8 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     assert "must\n  occur in this current source section" in aot_prompt
     assert "understanding A is required\n  before understanding B" in aot_prompt
     assert "component, part, layer, module, or\n  element of B" in aot_prompt
+    assert "edge direction is always part to whole" in aot_prompt
+    assert "do not make an endpoint a sentence, clause, formula, number, or pronoun" in aot_prompt
     assert "A explains, defines, or\n  describes B" in aot_prompt
     assert "does not imply direction, precedence, or composition" in aot_prompt
     assert "Usage, reliance, architectural basis, addition, application, possession, capability" in aot_prompt
@@ -259,6 +276,54 @@ def test_graph_verifier_rejects_invalid_structural_responses(response_text):
         )
 
     assert len(service.client.responses.calls) == 1
+
+
+def test_graph_recovery_accepts_grounded_part_of_edge_with_exact_quote():
+    service = make_service()
+    service.client = FakeClient(
+        response_texts=[
+            '{"edges":[{"source":"feed-forward network",'
+            '"relation":"PART_OF","target":"encoder layer",'
+            '"quote":"Each encoder layer contains a feed-forward network."}]}'
+        ]
+    )
+
+    assert service.extract_graph_edges_with_evidence(
+        "Each encoder layer contains a feed-forward network.", []
+    ) == [
+        {
+            "source": "feed-forward network",
+            "relation": "PART_OF",
+            "target": "encoder layer",
+            "quote": "Each encoder layer contains a feed-forward network.",
+        }
+    ]
+
+
+def test_graph_recovery_allows_empty_edges_when_no_direct_relation_exists():
+    service = make_service()
+    service.client = FakeClient(response_texts=['{"edges":[]}'])
+
+    assert service.extract_graph_edges_with_evidence("The model uses attention.", []) == []
+
+
+@pytest.mark.parametrize(
+    "response_text",
+    [
+        '{"edges":[{"source":"part","relation":"PART_OF",'
+        '"target":"whole","quote":"part is in whole", "extra":"x"}]}',
+        '{"edges":[{"source":"part","relation":"RELATES_TO",'
+        '"target":"whole","quote":"part is related to whole"}]}',
+        '{"edges":[{"source":"part","relation":"PART_OF",'
+        '"target":"whole","quote":"' + ("x" * 501) + '"}]}',
+    ],
+)
+def test_graph_recovery_rejects_unsafe_or_malformed_edges(response_text):
+    service = make_service()
+    service.client = FakeClient(response_texts=[response_text])
+
+    with pytest.raises(ValidationError):
+        service.extract_graph_edges_with_evidence("part is part of whole.", [])
 
 
 @pytest.mark.parametrize(
@@ -386,6 +451,162 @@ def test_rerank_honors_explicit_result_limit():
         "two",
         "one",
     ]
+
+
+def test_invalid_jina_rpm_is_normalized_to_safe_default():
+    service = LLMService(
+        SimpleNamespace(
+            OPENAI_BASE_URL="http://endpoint.test/v1",
+            OPENAI_API_KEY="test-key",
+            OPENAI_MODEL="test-chat",
+            OPENAI_EMBEDDING_MODEL="test-embedding",
+            JINA_API_KEY="jina-secret",
+            JINA_RPM=0,
+        )
+    )
+
+    assert service._jina_rpm == 100
+
+
+def test_jina_defaults_are_used_for_blank_url_and_nonfinite_margin():
+    service = LLMService(
+        SimpleNamespace(
+            OPENAI_BASE_URL="http://endpoint.test/v1",
+            OPENAI_API_KEY="test-key",
+            OPENAI_MODEL="test-chat",
+            OPENAI_EMBEDDING_MODEL="test-embedding",
+            JINA_RERANK_URL="",
+            JINA_RERANK_MARGIN=float("nan"),
+        )
+    )
+
+    assert service._jina_rerank_url == "https://api.jina.ai/v1/rerank"
+    assert service._jina_margin == 0.08
+
+
+def test_duplicate_jina_result_index_reaches_llm_fallback(monkeypatch):
+    service = make_service()
+    service._jina_api_key = "jina-secret"
+    service.client = FakeClient(response_texts=['{"best_parent_ids":["llm-parent"]}'])
+    monkeypatch.setattr(
+        llm_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: FakeHTTPResponse(
+            '{"results":[{"index":0,"relevance_score":0.95},'
+            '{"index":0,"relevance_score":0.10}]}'
+        ),
+    )
+    candidates = [
+        {"question": "one", "parent_id": "vector-parent", "key_knowledge": ""},
+        {"question": "two", "parent_id": "llm-parent", "key_knowledge": ""},
+    ]
+
+    assert service.cascade_rerank_candidate_questions("query", candidates) == (
+        ["llm-parent"],
+        "llm_fallback",
+    )
+
+
+def test_settings_keep_retrieval_contract_when_env_values_exceed_caps(monkeypatch):
+    monkeypatch.setenv("JINA_RPM", "0")
+    monkeypatch.setenv("QDRANT_SEARCH_LIMIT", "100")
+    monkeypatch.setenv("QDRANT_MAX_CANDIDATE_PARENTS", "100")
+
+    settings = Settings()
+
+    assert settings.JINA_RPM == 100
+    assert settings.QDRANT_SEARCH_LIMIT == 25
+    assert settings.QDRANT_MAX_CANDIDATE_PARENTS == 5
+
+
+def test_malformed_jina_result_reaches_llm_fallback(monkeypatch):
+    service = make_service()
+    service._jina_api_key = "jina-secret"
+    service.client = FakeClient(response_texts=['{"best_parent_ids":["llm-parent"]}'])
+    monkeypatch.setattr(
+        llm_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: FakeHTTPResponse(
+            '{"results":[{"index":0,"relevance_score":0.9},"malformed"]}'
+        ),
+    )
+    candidates = [
+        {"question": "one", "parent_id": "vector-parent", "key_knowledge": ""},
+        {"question": "two", "parent_id": "llm-parent", "key_knowledge": ""},
+    ]
+
+    assert service.cascade_rerank_candidate_questions("query", candidates) == (
+        ["llm-parent"],
+        "llm_fallback",
+    )
+    assert "jina-secret" not in service.client.responses.calls[0]["input"][1]["content"]
+
+
+def test_jina_rerank_parses_valid_results_and_keeps_provider_key_out_of_payload(
+    monkeypatch,
+):
+    service = make_service()
+    service._jina_api_key = "jina-secret"
+    monkeypatch.setattr(
+        llm_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: FakeHTTPResponse(
+            '{"results":[{"index":1,"relevance_score":0.95},'
+            '{"index":0,"relevance_score":0.20}]}'
+        ),
+    )
+    candidates = [
+        {"question": "one", "parent_id": "first", "key_knowledge": ""},
+        {"question": "two", "parent_id": "second", "key_knowledge": ""},
+    ]
+
+    result = service.jina_rerank_candidate_questions("query", candidates)
+
+    assert result == {"parent_ids": ["second", "first"], "scores": [0.95, 0.2]}
+
+
+def test_close_jina_scores_use_llm_fallback(monkeypatch):
+    service = make_service()
+    service._jina_api_key = "jina-secret"
+    service.client = FakeClient(response_texts=['{"best_parent_ids":["second"]}'])
+    monkeypatch.setattr(
+        llm_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: FakeHTTPResponse(
+            '{"results":[{"index":0,"relevance_score":0.91},'
+            '{"index":1,"relevance_score":0.90}]}'
+        ),
+    )
+    candidates = [
+        {"question": "one", "parent_id": "first", "key_knowledge": ""},
+        {"question": "two", "parent_id": "second", "key_knowledge": ""},
+    ]
+
+    assert service.cascade_rerank_candidate_questions("query", candidates) == (
+        ["second"],
+        "llm_fallback",
+    )
+
+
+def test_cascade_reports_llm_and_vector_provenance(monkeypatch):
+    candidates = [
+        {"question": "one", "parent_id": "first", "key_knowledge": ""},
+        {"question": "two", "parent_id": "second", "key_knowledge": ""},
+    ]
+    llm_service_instance = make_service()
+    llm_service_instance.client = FakeClient(
+        response_texts=['{"best_parent_ids":["second"]}']
+    )
+    assert llm_service_instance.cascade_rerank_candidate_questions(
+        "query", candidates
+    ) == (["second"], "llm")
+
+    vector_service = make_service()
+    vector_service.client = FakeClient(response_texts=['{"best_parent_ids":[]}'])
+    assert vector_service.cascade_rerank_candidate_questions("query", candidates) == (
+        ["first", "second"],
+        "vector",
+    )
 
 
 def test_answer_delimits_untrusted_evidence_and_removes_unknown_citations():

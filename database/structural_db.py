@@ -10,6 +10,9 @@ from qdrant_client import QdrantClient, models
 
 CURRICULUM_COLLECTION = "research_curriculum"
 QUESTIONS_COLLECTION = "research_questions"
+MAX_QDRANT_SEARCH_LIMIT = 25
+MAX_QDRANT_CANDIDATE_PARENTS = 5
+RERANK_SOURCES = {"jina", "llm_fallback", "llm", "vector"}
 
 
 class QdrantVectorStore:
@@ -27,6 +30,32 @@ class QdrantVectorStore:
         self.embedding_dim = settings.OPENAI_EMBEDDING_DIM
         self.curriculum_collection = curriculum_collection
         self.questions_collection = questions_collection
+        try:
+            self._search_limit = int(
+                getattr(settings, "QDRANT_SEARCH_LIMIT", MAX_QDRANT_SEARCH_LIMIT)
+                or MAX_QDRANT_SEARCH_LIMIT
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._search_limit = MAX_QDRANT_SEARCH_LIMIT
+        if self._search_limit < 1:
+            self._search_limit = MAX_QDRANT_SEARCH_LIMIT
+        self._search_limit = min(self._search_limit, MAX_QDRANT_SEARCH_LIMIT)
+        try:
+            self._max_candidate_parents = int(
+                getattr(
+                    settings,
+                    "QDRANT_MAX_CANDIDATE_PARENTS",
+                    MAX_QDRANT_CANDIDATE_PARENTS,
+                )
+                or MAX_QDRANT_CANDIDATE_PARENTS
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._max_candidate_parents = MAX_QDRANT_CANDIDATE_PARENTS
+        if self._max_candidate_parents < 1:
+            self._max_candidate_parents = MAX_QDRANT_CANDIDATE_PARENTS
+        self._max_candidate_parents = min(
+            self._max_candidate_parents, MAX_QDRANT_CANDIDATE_PARENTS
+        )
         self.ensure_collections()
 
     def ensure_collections(self) -> None:
@@ -311,7 +340,7 @@ class QdrantVectorStore:
                 else llm_service.embed(query)
             ),
             query_filter=models.Filter(must=conditions),
-            limit=25,
+            limit=self._search_limit,
             with_payload=True,
         ).points
         if not results:
@@ -335,16 +364,36 @@ class QdrantVectorStore:
             }
             candidates.append(candidate)
             candidates_by_parent[parent_id] = candidate
-            if len(candidates) == 5:
+            if len(candidates) == self._max_candidate_parents:
                 break
         if not candidates:
             return []
 
-        reranked_ids = llm_service.rerank_candidate_questions(query, candidates)
+        rerank_source = "vector"
+        reranked_ids: list[str] = []
+        cascade = getattr(llm_service, "cascade_rerank_candidate_questions", None)
+        if callable(cascade):
+            cascade_result = cascade(query, candidates)
+            if isinstance(cascade_result, tuple) and len(cascade_result) == 2:
+                candidate_ids, candidate_source = cascade_result
+                if isinstance(candidate_ids, list):
+                    reranked_ids = candidate_ids
+                if candidate_source in RERANK_SOURCES:
+                    rerank_source = candidate_source
+        else:
+            # Ponytail: lightweight legacy test doubles retain the old public method.
+            reranked_ids = llm_service.rerank_candidate_questions(query, candidates)
+            legacy_source = getattr(llm_service, "_last_rerank_source", "")
+            rerank_source = (
+                legacy_source
+                if legacy_source in {"llm", "vector"}
+                else ("llm" if reranked_ids else "vector")
+            )
         valid_reranked_ids = []
         for parent_id in reranked_ids or []:
             if (
-                parent_id in candidates_by_parent
+                isinstance(parent_id, str)
+                and parent_id in candidates_by_parent
                 and parent_id not in valid_reranked_ids
             ):
                 valid_reranked_ids.append(parent_id)
@@ -358,6 +407,8 @@ class QdrantVectorStore:
                 parent_ids.append(valid_reranked_ids[1])
         else:
             parent_ids = vector_parent_ids[:2]
+        if not valid_reranked_ids:
+            rerank_source = "vector"
 
         sections = []
         for parent_id in parent_ids:
@@ -367,5 +418,6 @@ class QdrantVectorStore:
             section["metadata"]["matched_knowledge"] = candidates_by_parent[parent_id].get(
                 "key_knowledge", ""
             )
+            section["metadata"]["_rerank_source"] = rerank_source
             sections.append(section)
         return sections

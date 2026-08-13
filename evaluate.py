@@ -19,6 +19,12 @@ from database.structural_db import QdrantVectorStore
 from orchestrator.llm_service import LLMService
 from runtime.engine import collect_anchor_nodes
 
+
+RERANK_SOURCES = ("jina", "llm_fallback", "llm", "vector")
+DEFAULT_QDRANT_SEARCH_LIMIT = 25
+DEFAULT_QDRANT_MAX_CANDIDATE_PARENTS = 5
+FINAL_PARENT_LIMIT = 2
+
 DATASET_PATH = Path("data/eval.json")
 RESULTS_PATH = Path("eval_results.json")
 
@@ -149,7 +155,7 @@ def summarize_runtime(
     expected_sources: list[set[str]],
     retrieval_latencies: list[float],
     graph_edges: list[int] | None = None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     result = runtime_metrics(
         rankings,
         expected_ids,
@@ -162,6 +168,33 @@ def summarize_runtime(
     return result
 
 
+def effective_retrieval_limits(db: Any) -> dict[str, int]:
+    """Report the bounded retrieval capacity actually configured on the store."""
+    try:
+        search_limit = int(
+            getattr(db, "_search_limit", DEFAULT_QDRANT_SEARCH_LIMIT)
+            or DEFAULT_QDRANT_SEARCH_LIMIT
+        )
+    except (TypeError, ValueError, OverflowError):
+        search_limit = DEFAULT_QDRANT_SEARCH_LIMIT
+    try:
+        max_parents = int(
+            getattr(db, "_max_candidate_parents", DEFAULT_QDRANT_MAX_CANDIDATE_PARENTS)
+            or DEFAULT_QDRANT_MAX_CANDIDATE_PARENTS
+        )
+    except (TypeError, ValueError, OverflowError):
+        max_parents = DEFAULT_QDRANT_MAX_CANDIDATE_PARENTS
+    if search_limit < 1:
+        search_limit = DEFAULT_QDRANT_SEARCH_LIMIT
+    if max_parents < 1:
+        max_parents = DEFAULT_QDRANT_MAX_CANDIDATE_PARENTS
+    return {
+        "qdrant_search_limit": min(search_limit, DEFAULT_QDRANT_SEARCH_LIMIT),
+        "max_candidate_parents": min(max_parents, DEFAULT_QDRANT_MAX_CANDIDATE_PARENTS),
+        "final_parent_limit": FINAL_PARENT_LIMIT,
+    }
+
+
 def evaluate_case(
     query: str,
     query_vector: list[float],
@@ -169,7 +202,7 @@ def evaluate_case(
     llm: LLMService,
     dag: Neo4jManager,
     target_file: str = "",
-) -> tuple[list[str], list[str], list[str], int, float]:
+) -> tuple[list[str], list[str], list[str], int, float, str]:
     baseline = parent_baseline(db, query_vector, target_file)
     retrieval_started = perf_counter()
     sections = db.search_candidates_and_fetch_parent(
@@ -185,12 +218,15 @@ def evaluate_case(
         str(item.get("parent_id", "")) for item in metadata if item.get("parent_id")
     ]
     sources = [str(item.get("source", "")) for item in metadata if item.get("source")]
+    rerank_source = str(
+        (metadata[0].get("_rerank_source", "") if metadata else "") or "vector"
+    )
     graph_context = dag.get_graph_context(
         collect_anchor_nodes(sections),
         search_mode="search",
         source=target_file,
     )
-    return baseline, parent_ids, sources, len(graph_context), retrieval_latency
+    return baseline, parent_ids, sources, len(graph_context), retrieval_latency, rerank_source
 
 
 def run_evaluation(dataset_path: Path = DATASET_PATH, workers: int = 4) -> dict[str, Any]:
@@ -235,25 +271,30 @@ def run_evaluation(dataset_path: Path = DATASET_PATH, workers: int = 4) -> dict[
     returned_sources = [result[2] for result in case_results]
     graph_edges = [result[3] for result in case_results]
     retrieval_latencies = [result[4] for result in case_results]
+    rerank_sources = [result[5] for result in case_results]
+    from collections import Counter
+
+    source_counts = Counter(rerank_sources)
+    rerank_source_rate = {
+        source: (source_counts.get(source, 0) / len(rerank_sources))
+        if rerank_sources
+        else 0.0
+        for source in RERANK_SOURCES
+    }
+    retrieval_limits = effective_retrieval_limits(db)
+    hyde_runtime = summarize_runtime(hyde_rankings, expected, returned_sources, expected_sources, retrieval_latencies)
+    hyde_runtime["rerank_source_rate"] = rerank_source_rate
+    hyde_runtime["effective_retrieval_limits"] = retrieval_limits
+    hyde_graph = summarize_runtime(hyde_rankings, expected, returned_sources, expected_sources, retrieval_latencies, graph_edges)
+    hyde_graph["rerank_source_rate"] = rerank_source_rate
+    hyde_graph["effective_retrieval_limits"] = retrieval_limits
     return {
         "question_count": len(cases),
         "categories": sorted({case["category"] for case in cases}),
         "parent_section_vector_baseline": summarize_method(baseline_rankings, expected),
-        "hyde_question_rerank": summarize_runtime(
-            hyde_rankings,
-            expected,
-            returned_sources,
-            expected_sources,
-            retrieval_latencies,
-        ),
-        "hyde_question_rerank_graph_context": summarize_runtime(
-            hyde_rankings,
-            expected,
-            returned_sources,
-            expected_sources,
-            retrieval_latencies,
-            graph_edges,
-        ),
+        "hyde_question_rerank": hyde_runtime,
+        "hyde_question_rerank_graph_context": hyde_graph,
+        "effective_retrieval_limits": retrieval_limits,
         "note": (
             "Graph context enriches answer generation after retrieval, so its Recall@2 and "
             "MRR match runtime retrieval; average_graph_edges reports the added context. "
@@ -267,7 +308,16 @@ def main() -> None:
     parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
     parser.add_argument("--output", type=Path, default=RESULTS_PATH)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--qdrant-limit", type=int, default=None)
+    parser.add_argument("--max-candidates", type=int, default=None)
     args = parser.parse_args()
+    if args.qdrant_limit is not None or args.max_candidates is not None:
+        import os
+
+        if args.qdrant_limit is not None:
+            os.environ["QDRANT_SEARCH_LIMIT"] = str(args.qdrant_limit)
+        if args.max_candidates is not None:
+            os.environ["QDRANT_MAX_CANDIDATE_PARENTS"] = str(args.max_candidates)
     result = run_evaluation(args.dataset, workers=args.workers)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))

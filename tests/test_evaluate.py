@@ -6,11 +6,24 @@ from qdrant_client import models
 
 import evaluate
 from evaluate import (
+    effective_retrieval_limits,
     expected_parent_ids,
     retrieval_metrics,
     runtime_metrics,
     summarize_method,
 )
+
+
+def test_effective_retrieval_limits_report_store_capacity_and_caps():
+    limits = effective_retrieval_limits(
+        SimpleNamespace(_search_limit=100, _max_candidate_parents=100)
+    )
+
+    assert limits == {
+        "qdrant_search_limit": 25,
+        "max_candidate_parents": 5,
+        "final_parent_limit": 2,
+    }
 
 
 def test_retrieval_metrics_measure_first_relevant_rank_and_recall_at_five():
@@ -114,13 +127,14 @@ def test_evaluate_case_uses_runtime_retrieval_sections_for_metrics_and_graph(
         "How does attention work?", [1.0], db, llm, dag, "paper.pdf"
     )
 
-    assert result == (
+    assert result[:5] == (
         ["baseline"],
         ["selected-parent"],
         ["paper.pdf"],
         1,
         pytest.approx(0.25),
     )
+    assert result[5] in ("jina", "llm_fallback", "llm", "vector")
     assert db.search_kwargs == {
         "query": "How does attention work?",
         "llm_service": llm,
@@ -193,6 +207,17 @@ def test_run_evaluation_records_shared_runtime_rankings(monkeypatch, tmp_path):
     assert runtime["mrr"] == 1.0
     assert runtime["all_expected_sources_rate"] == 1.0
     assert runtime["average_retrieval_latency_seconds"] >= 0.0
+    assert runtime["rerank_source_rate"] == {
+        "jina": 0.0,
+        "llm_fallback": 0.0,
+        "llm": 0.0,
+        "vector": 1.0,
+    }
+    assert runtime["effective_retrieval_limits"] == {
+        "qdrant_search_limit": 25,
+        "max_candidate_parents": 5,
+        "final_parent_limit": 2,
+    }
     assert "recall_at_5" not in runtime
     assert result["parent_section_vector_baseline"] == {
         "recall_at_5": 0.0,

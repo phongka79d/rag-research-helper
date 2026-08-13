@@ -31,11 +31,12 @@ class FakeLLM:
         return list(dict.fromkeys(candidate["parent_id"] for candidate in candidates))
 
 
-def make_store(embedding_dim=3, token=None):
+def make_store(embedding_dim=3, token=None, **setting_overrides):
     token = token or uuid.uuid4().hex
     settings = SimpleNamespace(
         QDRANT_URL="http://localhost:6333",
         OPENAI_EMBEDDING_DIM=embedding_dim,
+        **setting_overrides,
     )
     return QdrantVectorStore(
         settings,
@@ -83,6 +84,69 @@ def stub_question_retrieval(monkeypatch, store, points, reranker_output):
         },
     )
     return query_calls, rerank_calls
+
+
+def test_question_retrieval_clamps_configured_limits_and_ignores_hidden_override(
+    monkeypatch,
+):
+    store = make_store(
+        QDRANT_SEARCH_LIMIT=100,
+        QDRANT_MAX_CANDIDATE_PARENTS=100,
+    )
+    try:
+        store.llm._qdrant_search_limit = 1
+        parent_ids = [f"parent-{index}" for index in range(1, 8)]
+        points = [question_point(parent_id) for parent_id in parent_ids]
+        query_calls, rerank_calls = stub_question_retrieval(
+            monkeypatch, store, points, []
+        )
+
+        store.search_candidates_and_fetch_parent("query", store.llm)
+
+        assert query_calls[0]["limit"] == 25
+        assert len(rerank_calls[0][1]) == 5
+    finally:
+        delete_store(store)
+
+
+def test_question_retrieval_records_llm_provenance(monkeypatch):
+    store = make_store()
+    try:
+        points = [question_point("first"), question_point("second")]
+        stub_question_retrieval(monkeypatch, store, points, [])
+        monkeypatch.setattr(
+            store.llm,
+            "cascade_rerank_candidate_questions",
+            lambda query, candidates, limit=2: (["second"], "llm"),
+            raising=False,
+        )
+        sections = store.search_candidates_and_fetch_parent("query", store.llm)
+
+        assert sections[0]["metadata"]["_rerank_source"] == "llm"
+    finally:
+        delete_store(store)
+
+
+def test_legacy_vector_fallback_provenance_is_preserved_when_ids_return(monkeypatch):
+    store = make_store()
+    try:
+        store.llm._last_rerank_source = "vector"
+        parent_ids = ["vector-first", "vector-second"]
+        stub_question_retrieval(
+            monkeypatch,
+            store,
+            [question_point(parent_id) for parent_id in parent_ids],
+            parent_ids,
+        )
+
+        sections = store.search_candidates_and_fetch_parent("query", store.llm)
+
+        assert [section["metadata"]["_rerank_source"] for section in sections] == [
+            "vector",
+            "vector",
+        ]
+    finally:
+        delete_store(store)
 
 
 def test_question_retrieval_resolves_full_parent_section():

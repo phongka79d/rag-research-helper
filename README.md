@@ -34,7 +34,8 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 ├── runtime/                # Ask and Teach orchestration
 ├── data/
 │   ├── papers/             # Locally uploaded or sample papers
-│   └── eval.json           # Retrieval evaluation cases
+│   ├── eval.json           # Legacy/demo retrieval evaluation cases
+│   └── eval_real_papers.json # Source-scoped benchmark for the three supplied PDFs
 ├── tests/                  # Behavior-focused pytest coverage
 ├── main.py                 # Streamlit entry point
 ├── evaluate.py             # Baseline / HyDE-rerank / graph-context evaluation
@@ -57,15 +58,16 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 
 1. The sidebar in `main.py` saves the uploaded file under `data/papers/`.
 2. `DocumentProcessor` splits PDF or Markdown content into ordered sections with source, section, page, and sequence metadata.
-3. `ingest_document()` in `core/data_ingestion.py` asks `LLMService` for an AOT result: main concepts, a learning roadmap, and a small knowledge graph.
+3. `ingest_document()` in `core/data_ingestion.py` asks `LLMService` for an AOT result: main concepts, a learning roadmap, and a small knowledge graph. Direct whole-part evidence is kept only after source grounding, verifier approval, and the local quote gate; a single bounded graph-only recovery call is used only for a directly cued section that retained no normal edge.
 4. The graph is stored in Neo4j; roadmap steps and full parent sections are stored in `research_curriculum`; up to five directly answerable hypothetical question children are stored in `research_questions` (thin sections may have none).
 5. Each child question keeps its `parent_id`, so retrieval can resolve the complete original section.
+6. The completion result reports graph candidates, verifier approvals, and retained relationships. A zero in any counter is valid and makes an empty Graph tab diagnosable.
 
 ### 3. Ask a paper question
 
 1. `RuntimeEngine.ask()` calls `QdrantVectorStore.search_candidates_and_fetch_parent()`.
 2. The query embedding searches up to 25 hypothetical-question hits, optionally filtered to one paper, and keeps the first hit for at most five unique parent sections.
-3. `LLMService.rerank_candidate_questions()` reranks those parents; the final two-parent evidence set keeps the reranker's first choice and the leading vector parent, while invalid model output falls back to vector order.
+3. If `JINA_API_KEY` is configured, the optional Jina reranker receives the user query and candidate hypothetical questions. The cascade is Jina → OpenAI-compatible LLM reranker when Jina is unavailable/uncertain → vector order when no reranker selection is usable. The final evidence set remains at most two parents, and stores truthful provenance (`jina`, `llm_fallback`, `llm`, or `vector`).
 4. The engine reads 1–2 hop concept context from Neo4j and sends the parent text plus graph context to `LLMService.answer()`.
 5. The UI displays the answer, stored source labels, and optional graph context.
 
@@ -79,7 +81,7 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 ### 5. Inspect the graph and evaluate retrieval
 
 - The Graph tab queries `Neo4jManager.get_visual_graph(locator)` and renders concepts and relationships as tables.
-- `evaluate.py` compares the direct parent-section vector baseline with the same hypothetical-question retrieval and two-parent fusion used by Ask. It reports baseline Recall@5, runtime Recall@2 and MRR, all-expected-sources coverage, retrieval latency, and graph-context size in `eval_results.json`.
+- `evaluate.py` compares the direct parent-section vector baseline with the same hypothetical-question retrieval and two-parent fusion used by Ask. It reports baseline Recall@5, runtime Recall@2 and MRR, all-expected-sources coverage, retrieval latency, graph-context size, fixed four-way rerank provenance rates, and effective bounded retrieval capacities in `eval_results.json`.
 
 ## Architecture
 
@@ -92,7 +94,7 @@ PDF / Markdown
 Question
   → OpenAI embedding
   → Qdrant question search
-  → OpenAI rerank
+  → optional Jina rerank → OpenAI-compatible LLM fallback → vector order
   → parent section(s) + Neo4j context
   → grounded OpenAI answer + source labels
 ```
@@ -117,10 +119,12 @@ The key storage model is deliberately narrow:
 | --- | --- | --- |
 | OpenAI-compatible Responses API | AOT extraction, hypothetical questions, reranking, answers, and lessons | `orchestrator/llm_service.py` |
 | OpenAI-compatible Embeddings API | Query, section, roadmap, and question vectors | `orchestrator/llm_service.py` |
+| Optional Jina rerank API | Reranks the bounded query/question candidate pool when `JINA_API_KEY` is set | `orchestrator/llm_service.py` |
 | Qdrant | Parent sections, roadmap steps, and hypothetical question retrieval | `database/structural_db.py` |
 | Neo4j | Shared research concepts and bounded graph context | `database/semantic_dag.py` |
 | `data/papers/` | Uploaded/local paper files | `main.py` |
-| `data/eval.json` | Evaluation cases | `evaluate.py` |
+| `data/eval.json` | Legacy/demo evaluation cases | `evaluate.py` |
+| `data/eval_real_papers.json` | Three-real-paper evaluation cases | `evaluate.py` |
 
 ## Configuration
 
@@ -134,9 +138,16 @@ Copy `.env.example` to `.env`; never commit `.env` or its values.
 | `OPENAI_EMBEDDING_MODEL` | No | Embedding model; defaults to `text-embedding-3-small`. |
 | `OPENAI_EMBEDDING_DIM` | No | Qdrant vector size; defaults to `1536`. It must match the configured embedding model. |
 | `QDRANT_URL` | No | Qdrant endpoint; defaults to `http://localhost:6333`. |
+| `QDRANT_SEARCH_LIMIT` | No | Maximum question hits searched per query; defaults to 25 and is capped at 25. |
+| `QDRANT_MAX_CANDIDATE_PARENTS` | No | Maximum unique parents sent to reranking; defaults to 5 and is capped at 5. |
 | `NEO4J_URI` | No | Neo4j Bolt endpoint; defaults to `bolt://localhost:7687`. |
 | `NEO4J_USER` | No | Neo4j user; defaults to `neo4j`. |
 | `NEO4J_PASSWORD` | Yes | Local Neo4j password, created/recovered and verified by `setup_env.py`. |
+| `JINA_API_KEY` | No | Optional Jina credential. When set, query text and candidate questions are sent to the configured Jina endpoint for reranking. |
+| `JINA_RERANK_URL` | No | Jina-compatible rerank endpoint; defaults to `https://api.jina.ai/v1/rerank`. |
+| `JINA_RERANK_MODEL` | No | Jina rerank model; defaults to `jina-reranker-v2-base-multilingual`. |
+| `JINA_RPM` | No | Local Jina request-rate limit; invalid values use 100 requests/minute. |
+| `JINA_RERANK_MARGIN` | No | Minimum top-score margin before LLM fallback; defaults to 0.08. |
 
 ## Setup
 
@@ -150,7 +161,7 @@ Copy `.env.example` to `.env`; never commit `.env` or its values.
 
 2. Copy `.env.example` to `.env`, then set `OPENAI_API_KEY`.
 
-   The configured provider must support both the OpenAI Responses (`/v1/responses`) and Embeddings (`/v1/embeddings`) contracts used by this app. Changing any `OPENAI_*` value requires stopping and fully restarting Streamlit; refreshing the browser is not enough. A process-level `OPENAI_*` variable takes precedence over `.env`.
+   The configured provider must support both the OpenAI Responses (`/v1/responses`) and Embeddings (`/v1/embeddings`) contracts used by this app. Changing `.env` values requires stopping and fully restarting Streamlit; refreshing the browser is not enough. A process-level environment variable takes precedence over `.env`, so inspect the running process when a changed model appears to be ignored.
 
    Before ingesting a paper, run the opt-in compatibility checks. Each makes one provider request and does not write to Qdrant or Neo4j:
 
@@ -199,7 +210,22 @@ Run the evaluation against the ingested evaluation corpus:
 python evaluate.py --workers 4 --output eval_results.json
 ```
 
-The evaluation requires reachable Qdrant and Neo4j services, a configured OpenAI key, and the sections referenced by `data/eval.json` to be ingested.
+For a score covering only the supplied real papers, force-ingest those three
+PDFs once and run the dedicated corpus separately:
+
+```powershell
+python evaluate.py --dataset data/eval_real_papers.json --workers 1 --output eval_results_real_papers.json
+```
+
+The legacy `data/eval.json` and `eval_results.json` remain available for
+comparison; they include earlier demo-paper cases and are not the dedicated
+three-real-paper score.
+
+The evaluation requires reachable Qdrant and Neo4j services, a configured
+OpenAI-compatible provider key, and the sections referenced by the selected
+dataset to be ingested. It does not automatically retry failed cases; compare
+the reported effective limits and provenance rates when interpreting quality
+and latency changes.
 
 ## Development Notes for AI Agents
 
@@ -217,7 +243,7 @@ The evaluation requires reachable Qdrant and Neo4j services, a configured OpenAI
 - PDF extraction is best-effort `pypdf` text extraction; there is no OCR, layout model, or document-intelligence pipeline.
 - The graph view is a table/list rather than an interactive network visualization, matching the plan’s stated first-version fallback.
 - The app depends on local Qdrant and Neo4j plus a reachable OpenAI-compatible endpoint; it has no offline fallback.
-- AOT extraction quality and answer quality remain model-dependent. The application validates JSON structure and keeps a vector-order fallback only for invalid rerank output.
+- AOT extraction quality and answer quality remain model-dependent. The application validates JSON structure and falls back through the optional Jina → LLM → vector rerank cascade when needed.
 
 ## Reference Attribution
 
