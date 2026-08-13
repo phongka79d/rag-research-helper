@@ -1,23 +1,28 @@
 {
-  "question_count": 20,
+  "question_count": 28,
   "categories": [
     "conceptual",
     "cross-paper",
     "factual",
+    "process",
     "relational"
   ],
   "parent_section_vector_baseline": {
-    "recall_at_5": 0.95,
-    "mrr": 0.4325
+    "recall_at_5": 0.9285714285714286,
+    "mrr": 0.5398809523809524
   },
   "hyde_question_rerank": {
-    "recall_at_5": 0.95,
-    "mrr": 0.7166666666666667
+    "recall_at_2": 0.7321428571428571,
+    "mrr": 0.6428571428571429,
+    "all_expected_sources_rate": 0.8571428571428571,
+    "average_retrieval_latency_seconds": 2.369583342848013
   },
   "hyde_question_rerank_graph_context": {
-    "recall_at_5": 0.95,
-    "mrr": 0.7166666666666667,
-    "average_graph_edges": 16.95
+    "recall_at_2": 0.7321428571428571,
+    "mrr": 0.6428571428571429,
+    "all_expected_sources_rate": 0.8571428571428571,
+    "average_retrieval_latency_seconds": 2.369583342848013,
+    "average_graph_edges": 12.642857142857142
   },
-  "note": "Graph context enriches answer generation after retrieval, so its Recall@5 and MRR match HyDE plus rerank; average_graph_edges reports the added context."
+  "note": "Graph context enriches answer generation after retrieval, so its Recall@2 and MRR match runtime retrieval; average_graph_edges reports the added context. Recall@5 is retained only for the direct parent-vector baseline."
 }

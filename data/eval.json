@@ -22,5 +22,9 @@
   {"category":"conceptual","query":"Why does scaled dot-product attention divide by sqrt(d_k)?","expected":[{"source":"attention.pdf","section":"3.2.1 Scaled Dot-Product Attention"}]},
   {"category":"conceptual","query":"How does decoder masking prevent attention from seeing future positions?","expected":[{"source":"attention.pdf","section":"3.2.3 Applications of Attention in our Model"}]},
   {"category":"conceptual","query":"Why does the Transformer use positional encoding?","expected":[{"source":"attention.pdf","section":"3.5 Positional Encoding"}]},
-  {"category":"conceptual","query":"What does multi-head attention provide beyond a single attention head?","expected":[{"source":"attention.pdf","section":"3.2.2 Multi-Head Attention"}]}
+  {"category":"conceptual","query":"What does multi-head attention provide beyond a single attention head?","expected":[{"source":"attention.pdf","section":"3.2.2 Multi-Head Attention"}]},
+  {"category":"process","query":"Which techniques enable QLoRA's high-fidelity 4-bit finetuning?","target_file":"qlora_paper.pdf","expected":[{"source":"qlora_paper.pdf","section":"3 QL ORA Finetuning"}]},
+  {"category":"conceptual","query":"How does Double Quantization reduce QLoRA's memory footprint?","target_file":"qlora_paper.pdf","expected":[{"source":"qlora_paper.pdf","section":"3 QL ORA Finetuning"}]},
+  {"category":"process","query":"How does multi-head attention work and why is it useful?","target_file":"attention.pdf","expected":[{"source":"attention.pdf","section":"3.2.2 Multi-Head Attention"}]},
+  {"category":"process","query":"What does the LLM-to-SLM agent conversion algorithm do?","target_file":"slm_paper.pdf","expected":[{"source":"slm_paper.pdf","section":"6 LLM-to-SLM Agent Conversion Algorithm"}]}
 ]

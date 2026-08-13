@@ -298,39 +298,73 @@ class QdrantVectorStore:
         query: str,
         llm_service: Any,
         target_file: str = "",
+        query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         conditions = [self._condition("type", "question")]
         if target_file:
             conditions.append(self._condition("source", target_file))
         results = self.client.query_points(
             collection_name=self.questions_collection,
-            query=llm_service.embed(query),
+            query=(
+                query_vector
+                if query_vector is not None
+                else llm_service.embed(query)
+            ),
             query_filter=models.Filter(must=conditions),
-            limit=5,
+            limit=25,
             with_payload=True,
         ).points
         if not results:
             return []
 
-        candidates = [
-            {
-                "question": (record.payload or {}).get("page_content", ""),
-                "parent_id": (record.payload or {}).get("parent_id", ""),
-                "key_knowledge": (record.payload or {}).get("key_knowledge", ""),
+        candidates = []
+        candidates_by_parent = {}
+        for record in results:
+            payload = record.payload or {}
+            parent_id = payload.get("parent_id", "")
+            if (
+                not isinstance(parent_id, str)
+                or not parent_id.strip()
+                or parent_id in candidates_by_parent
+            ):
+                continue
+            candidate = {
+                "question": payload.get("page_content", ""),
+                "parent_id": parent_id,
+                "key_knowledge": payload.get("key_knowledge", ""),
             }
-            for record in results
-        ]
-        parent_ids = llm_service.rerank_candidate_questions(query, candidates)[:2]
+            candidates.append(candidate)
+            candidates_by_parent[parent_id] = candidate
+            if len(candidates) == 5:
+                break
+        if not candidates:
+            return []
+
+        reranked_ids = llm_service.rerank_candidate_questions(query, candidates)
+        valid_reranked_ids = []
+        for parent_id in reranked_ids or []:
+            if (
+                parent_id in candidates_by_parent
+                and parent_id not in valid_reranked_ids
+            ):
+                valid_reranked_ids.append(parent_id)
+
+        vector_parent_ids = list(candidates_by_parent)
+        if valid_reranked_ids:
+            parent_ids = [valid_reranked_ids[0]]
+            if valid_reranked_ids[0] != vector_parent_ids[0]:
+                parent_ids.append(vector_parent_ids[0])
+            elif len(valid_reranked_ids) > 1:
+                parent_ids.append(valid_reranked_ids[1])
+        else:
+            parent_ids = vector_parent_ids[:2]
+
         sections = []
         for parent_id in parent_ids:
             section = self._fetch_parent(parent_id)
             if section is None:
                 continue
-            matched = next(
-                (candidate for candidate in candidates if candidate["parent_id"] == parent_id),
-                {},
-            )
-            section["metadata"]["matched_knowledge"] = matched.get(
+            section["metadata"]["matched_knowledge"] = candidates_by_parent[parent_id].get(
                 "key_knowledge", ""
             )
             sections.append(section)

@@ -50,6 +50,41 @@ def delete_store(store):
         store.client.delete_collection(collection)
 
 
+def question_point(parent_id, question=None, knowledge=None):
+    return SimpleNamespace(
+        payload={
+            "page_content": question or f"question {parent_id}",
+            "parent_id": parent_id,
+            "key_knowledge": knowledge or f"knowledge {parent_id}",
+        }
+    )
+
+
+def stub_question_retrieval(monkeypatch, store, points, reranker_output):
+    query_calls = []
+    rerank_calls = []
+
+    def query_points(**kwargs):
+        query_calls.append(kwargs)
+        return SimpleNamespace(points=points)
+
+    def rerank(query, candidates):
+        rerank_calls.append((query, candidates))
+        return reranker_output
+
+    monkeypatch.setattr(store.client, "query_points", query_points)
+    monkeypatch.setattr(store.llm, "rerank_candidate_questions", rerank)
+    monkeypatch.setattr(
+        store,
+        "_fetch_parent",
+        lambda parent_id: {
+            "page_content": parent_id,
+            "metadata": {"parent_id": parent_id, "source": "paper.pdf"},
+        },
+    )
+    return query_calls, rerank_calls
+
+
 def test_question_retrieval_resolves_full_parent_section():
     store = make_store()
     try:
@@ -84,6 +119,134 @@ def test_question_retrieval_resolves_full_parent_section():
         assert sections[0]["metadata"]["matched_knowledge"] == (
             "The base model weights remain frozen."
         )
+    finally:
+        delete_store(store)
+
+
+def test_question_retrieval_builds_five_unique_candidates_from_25_hits(monkeypatch):
+    store = make_store()
+    try:
+        parent_ids = [f"parent-{index}" for index in range(1, 7)]
+        points = [
+            question_point(parent_ids[0], "first question", "first knowledge"),
+            question_point(parent_ids[0], "duplicate question", "duplicate knowledge"),
+            question_point(""),
+            question_point("   "),
+            *(question_point(parent_id) for parent_id in parent_ids[1:]),
+        ]
+        query_calls, rerank_calls = stub_question_retrieval(
+            monkeypatch, store, points, []
+        )
+
+        sections = store.search_candidates_and_fetch_parent(
+            "How does it work?", store.llm, "paper.pdf"
+        )
+
+        assert query_calls[0]["limit"] == 25
+        conditions = query_calls[0]["query_filter"].must
+        assert [(condition.key, condition.match.value) for condition in conditions] == [
+            ("type", "question"),
+            ("source", "paper.pdf"),
+        ]
+        candidates = rerank_calls[0][1]
+        assert [candidate["parent_id"] for candidate in candidates] == parent_ids[:5]
+        assert candidates[0] == {
+            "question": "first question",
+            "parent_id": parent_ids[0],
+            "key_knowledge": "first knowledge",
+        }
+        assert [section["metadata"]["parent_id"] for section in sections] == parent_ids[:2]
+    finally:
+        delete_store(store)
+
+
+def test_question_retrieval_fuses_reranker_first_with_vector_top(monkeypatch):
+    store = make_store()
+    try:
+        precomputed_vector = [0.25, 0.5, 1.0]
+        parent_ids = ["vector-top", "reranker-top", "third-parent"]
+        query_calls, _ = stub_question_retrieval(
+            monkeypatch,
+            store,
+            [question_point(parent_id) for parent_id in parent_ids],
+            [parent_ids[1]],
+        )
+
+        sections = store.search_candidates_and_fetch_parent(
+            "How does it work?",
+            store.llm,
+            query_vector=precomputed_vector,
+        )
+
+        assert store.llm.embed_calls == []
+        assert query_calls[0]["query"] is precomputed_vector
+        assert [section["metadata"]["parent_id"] for section in sections] == [
+            parent_ids[1],
+            parent_ids[0],
+        ]
+        assert [section["metadata"]["matched_knowledge"] for section in sections] == [
+            "knowledge reranker-top",
+            "knowledge vector-top",
+        ]
+    finally:
+        delete_store(store)
+
+
+def test_question_retrieval_deduplicates_matching_reranker_and_fills_next(monkeypatch):
+    store = make_store()
+    try:
+        parent_ids = ["vector-top", "reranker-second", "reranker-third"]
+        stub_question_retrieval(
+            monkeypatch,
+            store,
+            [question_point(parent_id) for parent_id in parent_ids],
+            [
+                parent_ids[0],
+                parent_ids[0],
+                parent_ids[1],
+                parent_ids[2],
+            ],
+        )
+
+        sections = store.search_candidates_and_fetch_parent(
+            "How does it work?", store.llm
+        )
+
+        assert [section["metadata"]["parent_id"] for section in sections] == [
+            parent_ids[0],
+            parent_ids[1],
+        ]
+        assert [section["metadata"]["matched_knowledge"] for section in sections] == [
+            "knowledge vector-top",
+            "knowledge reranker-second",
+        ]
+    finally:
+        delete_store(store)
+
+
+@pytest.mark.parametrize("reranker_output", [[], ["unknown-parent", None]])
+def test_question_retrieval_invalid_reranker_falls_back_to_vector_order(
+    monkeypatch, reranker_output
+):
+    store = make_store()
+    try:
+        parent_ids = ["vector-first", "vector-second", "vector-third"]
+        stub_question_retrieval(
+            monkeypatch,
+            store,
+            [question_point(parent_id) for parent_id in parent_ids],
+            reranker_output,
+        )
+
+        sections = store.search_candidates_and_fetch_parent(
+            "How does it work?", store.llm
+        )
+
+        assert [section["metadata"]["parent_id"] for section in sections] == parent_ids[:2]
+        assert [section["metadata"]["matched_knowledge"] for section in sections] == [
+            "knowledge vector-first",
+            "knowledge vector-second",
+        ]
     finally:
         delete_store(store)
 

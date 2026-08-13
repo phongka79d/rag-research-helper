@@ -64,8 +64,8 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 ### 3. Ask a paper question
 
 1. `RuntimeEngine.ask()` calls `QdrantVectorStore.search_candidates_and_fetch_parent()`.
-2. The query embedding searches the top five hypothetical questions, optionally filtered to one paper.
-3. `LLMService.rerank_candidate_questions()` selects one or two valid parent IDs; invalid model output falls back to the leading vector candidate.
+2. The query embedding searches up to 25 hypothetical-question hits, optionally filtered to one paper, and keeps the first hit for at most five unique parent sections.
+3. `LLMService.rerank_candidate_questions()` reranks those parents; the final two-parent evidence set keeps the reranker's first choice and the leading vector parent, while invalid model output falls back to vector order.
 4. The engine reads 1–2 hop concept context from Neo4j and sends the parent text plus graph context to `LLMService.answer()`.
 5. The UI displays the answer, stored source labels, and optional graph context.
 
@@ -79,7 +79,7 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 ### 5. Inspect the graph and evaluate retrieval
 
 - The Graph tab queries `Neo4jManager.get_visual_graph(locator)` and renders concepts and relationships as tables.
-- `evaluate.py` runs three retrieval views over `data/eval.json`: parent-section vector baseline, hypothetical-question retrieval plus rerank, and the same retrieval with reported graph-context size. It writes `eval_results.json` with Recall@5 and MRR.
+- `evaluate.py` compares the direct parent-section vector baseline with the same hypothetical-question retrieval and two-parent fusion used by Ask. It reports baseline Recall@5, runtime Recall@2 and MRR, all-expected-sources coverage, retrieval latency, and graph-context size in `eval_results.json`.
 
 ## Architecture
 
