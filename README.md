@@ -135,6 +135,7 @@ Copy `.env.example` to `.env`; never commit `.env` or its values.
 | `OPENAI_BASE_URL` | No | OpenAI-compatible `/v1` base URL; defaults to `https://api.shopaikey.com/v1`. |
 | `OPENAI_API_KEY` | Yes for app and evaluation | Credential passed to the configured provider through the OpenAI SDK. |
 | `OPENAI_MODEL` | No | Text model; defaults to `gpt-4o-mini`. |
+| `OPENAI_GRAPH_MODEL` | No | Graph extraction/verifier/recovery model; blank falls back to `OPENAI_MODEL` (for example, `gpt-4.1-nano`). It uses the same compatible endpoint and key. |
 | `OPENAI_EMBEDDING_MODEL` | No | Embedding model; defaults to `text-embedding-3-small`. |
 | `OPENAI_EMBEDDING_DIM` | No | Qdrant vector size; defaults to `1536`. It must match the configured embedding model. |
 | `QDRANT_URL` | No | Qdrant endpoint; defaults to `http://localhost:6333`. |
@@ -163,7 +164,7 @@ Copy `.env.example` to `.env`; never commit `.env` or its values.
 
    The configured provider must support both the OpenAI Responses (`/v1/responses`) and Embeddings (`/v1/embeddings`) contracts used by this app. Changing `.env` values requires stopping and fully restarting Streamlit; refreshing the browser is not enough. A process-level environment variable takes precedence over `.env`, so inspect the running process when a changed model appears to be ignored.
 
-   Before ingesting a paper, run the opt-in compatibility checks. Each makes one provider request and does not write to Qdrant or Neo4j:
+   Before ingesting a paper, run the opt-in compatibility checks. The Responses check makes one request for the text model and one for a distinct graph model (one request total when the graph setting falls back); neither check writes to Qdrant or Neo4j:
 
    ```powershell
    python scripts/live_test_responses.py
@@ -195,6 +196,28 @@ streamlit run main.py
 ```
 
 Upload a PDF, `.md`, or `.markdown` file in the sidebar. Ingestion uses the configured OpenAI-compatible endpoint and writes the compiled material into the local Qdrant and Neo4j services.
+
+When `OPENAI_GRAPH_MODEL` is set, roadmap and hypothetical-question generation stay on
+`OPENAI_MODEL`; graph extraction, verification, and recovery use the graph model. The
+plan, graph, and question requests for one section run in a small bounded group. Both
+models still use the same `OPENAI_BASE_URL` and `OPENAI_API_KEY`. Restart the Streamlit
+process after changing `.env`; a process environment variable takes precedence over
+`.env`.
+
+For an OCR/layout experiment, run the opt-in MinerU Agent Flash helper:
+
+```powershell
+python scripts/mineru_flash.py data/papers/your-paper.pdf --output data/mineru --batch-size 10
+```
+
+It uses the no-token signed-upload endpoint, submits contiguous page ranges (default
+10, maximum 20), polls each task, and writes Markdown plus a JSON manifest. Flash is
+IP-rate-limited, accepts files up to 10 MB and 20 pages per request, and returns
+Markdown only. The local PDF is uploaded to MinerU; do not use it for sensitive papers
+without reviewing that privacy implication. A failed batch produces `complete=false`
+and is never silently treated as a complete document. The command does not replace the
+existing parser or write Qdrant/Neo4j data; select the resulting Markdown explicitly if
+you later want to compare ingestion quality.
 
 ## Testing and Validation
 

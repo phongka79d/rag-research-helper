@@ -93,6 +93,23 @@ class SectionAOTResult(BaseModel):
     knowledge_graph: KnowledgeGraph = Field(default_factory=KnowledgeGraph)
 
 
+class SectionPlanResult(BaseModel):
+    """Narrow validated payload for the text-model planning request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    main_entities: list[str] = Field(default_factory=list)
+    learning_roadmap: list[RoadmapStep] = Field(default_factory=list)
+
+
+class SectionGraphResult(BaseModel):
+    """Narrow validated payload for the graph-model extraction request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    knowledge_graph: KnowledgeGraph = Field(default_factory=KnowledgeGraph)
+
+
 class HypotheticalQA(BaseModel):
     question: str
     key_knowledge: str

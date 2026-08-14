@@ -144,6 +144,43 @@ class ConcurrentLLM(FakeLLM):
         return super().generate_hypothetical_questions(text, num_questions, section_title)
 
 
+class SplitExtractionLLM(FakeLLM):
+    """Test double for the independent text-plan and graph boundaries."""
+
+    def __init__(self):
+        super().__init__()
+        self.plan_started = threading.Event()
+        self.graph_started = threading.Event()
+        self.questions_started = threading.Event()
+        self.plan_node_calls: list[list[str]] = []
+        self.graph_node_calls: list[list[str]] = []
+
+    def extract_section_plan(self, text, existing_nodes):
+        self.plan_started.set()
+        assert self.graph_started.wait(2)
+        self.plan_node_calls.append(list(existing_nodes))
+        # A provider must not be able to mutate the ingestion context through
+        # the list it receives.
+        existing_nodes.append("provider-local-plan-term")
+        return {
+            "main_entities": self.aot["main_entities"],
+            "learning_roadmap": self.aot["learning_roadmap"],
+        }
+
+    def extract_section_graph(self, text, existing_nodes):
+        self.graph_started.set()
+        assert self.plan_started.wait(2)
+        self.graph_node_calls.append(list(existing_nodes))
+        existing_nodes.append("provider-local-graph-term")
+        return {"knowledge_graph": self.aot["knowledge_graph"]}
+
+    def generate_hypothetical_questions(self, text, num_questions, section_title=""):
+        self.questions_started.set()
+        assert self.plan_started.wait(2)
+        assert self.graph_started.wait(2)
+        return super().generate_hypothetical_questions(text, num_questions, section_title)
+
+
 class FailingQuestionsLLM(FakeLLM):
     def generate_hypothetical_questions(self, text, num_questions, section_title=""):
         raise RuntimeError("question generation failed")
@@ -967,6 +1004,47 @@ def test_generation_calls_overlap_without_concurrent_section_persistence():
     assert llm.aot_started.is_set()
     assert llm.questions_started.is_set()
     assert [call[0] for call in store.calls] == ["delete", "curriculum", "questions"]
+
+
+def test_split_plan_graph_and_questions_overlap_and_merge_without_context_aliasing():
+    llm = SplitExtractionLLM()
+    store = FakeStore()
+    dag = FakeDAG()
+
+    result = ingest_document("ignored.md", store, llm, dag, processor=FakeProcessor())
+
+    assert result == expected_result(["lora.md::Method"], [])
+    assert llm.plan_started.is_set()
+    assert llm.graph_started.is_set()
+    assert llm.questions_started.is_set()
+    assert llm.plan_node_calls == [[]]
+    assert llm.graph_node_calls == [[]]
+    assert dag.saved[0]["edges"] == [
+        {
+            "source": "Low-Rank Matrix",
+            "target": "LoRA",
+            "relation": "PART_OF",
+        }
+    ]
+
+
+def test_split_graph_failure_writes_nothing_for_current_section():
+    class FailingSplitGraph(SplitExtractionLLM):
+        def extract_section_graph(self, text, existing_nodes):
+            self.graph_started.set()
+            assert self.plan_started.wait(2)
+            raise RuntimeError("split graph extraction failed")
+
+    store = FakeStore()
+    dag = FakeDAG()
+    with pytest.raises(RuntimeError, match="split graph extraction failed"):
+        ingest_document(
+            "ignored.md", store, FailingSplitGraph(), dag, processor=FakeProcessor()
+        )
+
+    assert store.calls == []
+    assert dag.saved == []
+    assert dag.removed == []
 
 
 def test_graph_verification_overlaps_questions_with_two_workers():

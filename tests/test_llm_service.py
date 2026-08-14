@@ -49,6 +49,7 @@ def make_service():
             OPENAI_BASE_URL="http://endpoint.test/v1",
             OPENAI_API_KEY="test-key",
             OPENAI_MODEL="test-chat",
+            OPENAI_GRAPH_MODEL="",
             OPENAI_EMBEDDING_MODEL="test-embedding",
         )
     )
@@ -84,7 +85,43 @@ def test_client_uses_configured_compatible_endpoint_and_models(monkeypatch):
         "base_url": "http://endpoint.test/v1",
     }
     assert service.model == "test-chat"
+    assert service.graph_model == "test-chat"
     assert service.embedding_model == "test-embedding"
+
+
+def test_graph_model_uses_same_client_and_falls_back_when_blank(monkeypatch):
+    captured = {}
+
+    class CapturingOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(llm_service, "OpenAI", CapturingOpenAI)
+    service = LLMService(
+        SimpleNamespace(
+            OPENAI_BASE_URL="http://endpoint.test/v1",
+            OPENAI_API_KEY="test-key",
+            OPENAI_MODEL="text-model",
+            OPENAI_GRAPH_MODEL="  graph-model  ",
+            OPENAI_EMBEDDING_MODEL="test-embedding",
+        )
+    )
+    assert service.graph_model == "graph-model"
+    assert captured == {
+        "api_key": "test-key",
+        "base_url": "http://endpoint.test/v1",
+    }
+
+    fallback = LLMService(
+        SimpleNamespace(
+            OPENAI_BASE_URL="http://endpoint.test/v1",
+            OPENAI_API_KEY="test-key",
+            OPENAI_MODEL="text-model",
+            OPENAI_GRAPH_MODEL="",
+            OPENAI_EMBEDDING_MODEL="test-embedding",
+        )
+    )
+    assert fallback.graph_model == fallback.model == "text-model"
 
 
 def test_provider_failures_are_operation_specific_and_redact_api_key():
@@ -134,8 +171,9 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     service.client = FakeClient(
         response_texts=[
             "```json\n"
-            '{"main_entities":["LoRA"],"learning_roadmap":[{"title":"Method","content_focus":"low-rank update","concepts":["LoRA"]}],"knowledge_graph":{"nodes":[{"name":"LoRA","description":"adaptation"}],"edges":[{"source":"Matrix","target":"LoRA","relation":"unknown"}]}}\n'
+            '{"main_entities":["LoRA"],"learning_roadmap":[{"title":"Method","content_focus":"low-rank update","concepts":["LoRA"]}]}\n'
             "```",
+            '{"knowledge_graph":{"nodes":[{"name":"LoRA","description":"adaptation"}],"edges":[{"source":"Matrix","target":"LoRA","relation":"unknown"}]}}',
             '{"qa_pairs":[{"question":"What is LoRA?","key_knowledge":"A low-rank adaptation method."},{"question":"What stays frozen?","key_knowledge":"The base weights."}]}',
         ]
     )
@@ -152,15 +190,18 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     assert [call["model"] for call in service.client.responses.calls] == [
         "test-chat",
         "test-chat",
+        "test-chat",
     ]
     assert all(
         "reasoning" not in call
         and call["text"] == {"format": {"type": "json_object"}}
         for call in service.client.responses.calls
     )
-    aot_prompt = service.client.responses.calls[0]["input"][1]["content"]
-    assert "earlier sections of this same paper" in aot_prompt
-    assert "must\n  occur in this current source section" in aot_prompt
+    plan_prompt = service.client.responses.calls[0]["input"][1]["content"]
+    assert "earlier sections of this same paper" in plan_prompt
+    assert "must occur in this current source section" in plan_prompt
+    graph_prompt = service.client.responses.calls[1]["input"][1]["content"]
+    aot_prompt = graph_prompt
     assert "understanding A is required\n  before understanding B" in aot_prompt
     assert "component, part, layer, module, or\n  element of B" in aot_prompt
     assert "edge direction is always part to whole" in aot_prompt
@@ -181,7 +222,7 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     assert "differs from an existing name only by letter case" in aot_prompt
     assert "Do not merge names by removing whitespace or punctuation" in aot_prompt
 
-    qa_prompt = service.client.responses.calls[1]["input"][1]["content"]
+    qa_prompt = service.client.responses.calls[2]["input"][1]["content"]
     assert "directly and completely answer its question" in qa_prompt
     assert "numeric, count, list, or comparison questions" in qa_prompt
     assert "including relevant units, scope, and conditions" in qa_prompt
@@ -190,6 +231,41 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     assert "Return zero pairs when the section lacks a directly answerable distinct question" in qa_prompt
     assert "Do not infer an answer from another section" in qa_prompt
     assert "Section heading context" not in qa_prompt
+
+
+def test_plan_and_graph_requests_route_to_their_configured_models():
+    service = LLMService(
+        SimpleNamespace(
+            OPENAI_BASE_URL="http://endpoint.test/v1",
+            OPENAI_API_KEY="test-key",
+            OPENAI_MODEL="text-model",
+            OPENAI_GRAPH_MODEL="graph-model",
+            OPENAI_EMBEDDING_MODEL="test-embedding",
+        )
+    )
+    service.client = FakeClient(
+        response_texts=[
+            '{"main_entities":["A"],"learning_roadmap":[]}',
+            '{"knowledge_graph":{"nodes":[],"edges":[]}}',
+            '{"approvals":[]}',
+            '{"edges":[]}',
+            '{"qa_pairs":[]}',
+        ]
+    )
+
+    service.extract_section_plan("A", [])
+    service.extract_section_graph("A", [])
+    service.verify_graph_edges("A is related to B.", [{"source": "A", "relation": "RELATES_TO", "target": "B"}])
+    service.extract_graph_edges_with_evidence("A is part of B.", [])
+    service.generate_hypothetical_questions("A", 0)
+
+    assert [call["model"] for call in service.client.responses.calls] == [
+        "text-model",
+        "graph-model",
+        "graph-model",
+        "graph-model",
+        "text-model",
+    ]
 
 
 def test_graph_verifier_uses_indexed_immutable_candidates_and_exact_quote_contract():

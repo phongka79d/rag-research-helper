@@ -19,6 +19,9 @@ class Settings:
         ).rstrip("/")
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
         self.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        # Optional graph-only model.  LLMService resolves a blank value to
+        # OPENAI_MODEL so existing environments keep their current behavior.
+        self.OPENAI_GRAPH_MODEL = os.getenv("OPENAI_GRAPH_MODEL", "").strip()
         self.OPENAI_EMBEDDING_MODEL = os.getenv(
             "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
         )

@@ -343,6 +343,51 @@ def _append_paper_nodes(existing_nodes: list[str], aot: dict[str, Any]) -> None:
             known.add(normalized_name)
 
 
+def _payload_dict(payload: Any, label: str) -> dict[str, Any]:
+    """Return a plain response mapping before the plan/graph merge.
+
+    The production LLM service returns ``model_dump()`` mappings, while small
+    test doubles may return a Pydantic response model directly.  Keeping this
+    conversion at the ingestion boundary lets the two independently validated
+    responses share the existing filtering and persistence path.
+    """
+    if isinstance(payload, dict):
+        return payload
+    model_dump = getattr(payload, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    raise TypeError(f"{label} extraction returned a non-object payload.")
+
+
+def _merge_plan_and_graph(plan_payload: Any, graph_payload: Any) -> dict[str, Any]:
+    """Combine separately validated plan and graph responses into the AOT shape."""
+    plan = _payload_dict(plan_payload, "plan")
+    graph = _payload_dict(graph_payload, "graph")
+    if not isinstance(plan.get("main_entities", []), list) or not isinstance(
+        plan.get("learning_roadmap", []), list
+    ):
+        raise TypeError("plan extraction returned an invalid response shape.")
+    # Accept the merged key as a small compatibility convenience for custom
+    # providers, while the split LLM boundary normally returns nodes/edges.
+    graph = graph.get("knowledge_graph", graph)
+    if not isinstance(graph, dict):
+        raise TypeError("graph extraction returned an invalid knowledge graph.")
+    if not isinstance(graph.get("nodes", []), list) or not isinstance(
+        graph.get("edges", []), list
+    ):
+        raise TypeError("graph extraction returned an invalid response shape.")
+    return {
+        "main_entities": plan.get("main_entities", []),
+        "learning_roadmap": plan.get("learning_roadmap", []),
+        "knowledge_graph": {
+            "nodes": graph.get("nodes", []),
+            "edges": graph.get("edges", []),
+        },
+    }
+
+
 def _report_progress(
     callback: Callable[[dict[str, Any]], None] | None,
     completed: int,
@@ -414,19 +459,45 @@ def ingest_document(
         replacement_started = False
         try:
             _report_progress(progress_callback, completed, total, label, "compiling")
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                aot_future = executor.submit(
-                    llm.extract_section_plan_and_graph,
-                    full_text,
-                    existing_nodes=list(existing_nodes),
-                )
+            # The split service boundary lets roadmap/plan work stay on the
+            # configured text model while graph work is routed independently.
+            # Keep the legacy combined call for lightweight providers and test
+            # doubles that have not adopted the new optional methods yet.
+            plan_extractor = getattr(llm, "extract_section_plan", None)
+            graph_extractor = getattr(llm, "extract_section_graph", None)
+            use_split_extraction = callable(plan_extractor) and callable(graph_extractor)
+            worker_count = 3 if use_split_extraction else 2
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                if use_split_extraction:
+                    plan_future = executor.submit(
+                        plan_extractor,
+                        full_text,
+                        existing_nodes=list(existing_nodes),
+                    )
+                    graph_future = executor.submit(
+                        graph_extractor,
+                        full_text,
+                        existing_nodes=list(existing_nodes),
+                    )
+                else:
+                    aot_future = executor.submit(
+                        llm.extract_section_plan_and_graph,
+                        full_text,
+                        existing_nodes=list(existing_nodes),
+                    )
                 questions_future = executor.submit(
                     llm.generate_hypothetical_questions,
                     full_text,
                     num_questions=5,
                     section_title=metadata["section"],
                 )
-                aot = filter_aot_to_section(aot_future.result(), full_text)
+                if use_split_extraction:
+                    aot = _merge_plan_and_graph(
+                        plan_future.result(), graph_future.result()
+                    )
+                else:
+                    aot = aot_future.result()
+                aot = filter_aot_to_section(aot, full_text)
                 graph = aot.get("knowledge_graph", {})
                 # Ponytail: omit surplus candidates rather than expanding the
                 # verifier request budget or persisting unverified edges.

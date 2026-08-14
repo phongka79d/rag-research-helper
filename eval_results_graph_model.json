@@ -1,0 +1,55 @@
+{
+  "question_count": 36,
+  "categories": [
+    "conceptual",
+    "cross-paper",
+    "factual",
+    "process",
+    "relational"
+  ],
+  "parent_section_vector_baseline": {
+    "recall_at_5": 0.9722222222222222,
+    "mrr": 0.7972222222222223
+  },
+  "hyde_question_rerank": {
+    "recall_at_2": 0.6666666666666666,
+    "mrr": 0.6527777777777778,
+    "all_expected_sources_rate": 0.8888888888888888,
+    "average_retrieval_latency_seconds": 1.912695836114128,
+    "rerank_source_rate": {
+      "jina": 0.5833333333333334,
+      "llm_fallback": 0.4166666666666667,
+      "llm": 0.0,
+      "vector": 0.0
+    },
+    "effective_retrieval_limits": {
+      "qdrant_search_limit": 25,
+      "max_candidate_parents": 5,
+      "final_parent_limit": 2
+    }
+  },
+  "hyde_question_rerank_graph_context": {
+    "recall_at_2": 0.6666666666666666,
+    "mrr": 0.6527777777777778,
+    "all_expected_sources_rate": 0.8888888888888888,
+    "average_retrieval_latency_seconds": 1.912695836114128,
+    "average_graph_edges": 0,
+    "rerank_source_rate": {
+      "jina": 0.5833333333333334,
+      "llm_fallback": 0.4166666666666667,
+      "llm": 0.0,
+      "vector": 0.0
+    },
+    "effective_retrieval_limits": {
+      "qdrant_search_limit": 25,
+      "max_candidate_parents": 5,
+      "final_parent_limit": 2
+    }
+  },
+  "effective_retrieval_limits": {
+    "qdrant_search_limit": 25,
+    "max_candidate_parents": 5,
+    "final_parent_limit": 2
+  },
+  "note": "Graph context enriches answer generation after retrieval, so its Recall@2 and MRR match runtime retrieval; average_graph_edges reports the added context. Recall@5 is retained only for the direct parent-vector baseline."
+}

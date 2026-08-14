@@ -9,6 +9,7 @@ def configured_settings():
         OPENAI_BASE_URL="http://endpoint.test/v1",
         OPENAI_API_KEY="test-key",
         OPENAI_MODEL="test-chat",
+        OPENAI_GRAPH_MODEL="",
         OPENAI_EMBEDDING_MODEL="test-embedding",
     )
 
@@ -16,7 +17,7 @@ def configured_settings():
 def test_responses_check_uses_structured_request_and_reports_non_secret_result(
     monkeypatch, capsys
 ):
-    captured = {}
+    captured = {"requests": []}
 
     class FakeOpenAI:
         def __init__(self, **kwargs):
@@ -24,7 +25,7 @@ def test_responses_check_uses_structured_request_and_reports_non_secret_result(
             self.responses = SimpleNamespace(create=self.create)
 
         def create(self, **kwargs):
-            captured["request"] = kwargs
+            captured["requests"].append(kwargs)
             return SimpleNamespace(output_text='{"status":"ok"}', model="served-model")
 
     monkeypatch.setattr(live_test_responses, "Settings", configured_settings)
@@ -36,11 +37,38 @@ def test_responses_check_uses_structured_request_and_reports_non_secret_result(
         "api_key": "test-key",
         "base_url": "http://endpoint.test/v1",
     }
-    assert captured["request"]["model"] == "test-chat"
-    assert "reasoning" not in captured["request"]
-    assert captured["request"]["text"] == {"format": {"type": "json_object"}}
-    assert "requested_model=test-chat" in output
+    assert [request["model"] for request in captured["requests"]] == ["test-chat"]
+    assert "reasoning" not in captured["requests"][0]
+    assert captured["requests"][0]["text"] == {"format": {"type": "json_object"}}
+    assert "role=text, requested_model=test-chat" in output
+    assert "text_model=test-chat, graph_model=test-chat, requests=1" in output
     assert "test-key" not in output
+
+
+def test_responses_check_tests_distinct_graph_model(monkeypatch, capsys):
+    captured = []
+
+    def configured_with_graph():
+        settings = configured_settings()
+        settings.OPENAI_GRAPH_MODEL = "graph-model"
+        return settings
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.responses = SimpleNamespace(create=self.create)
+
+        def create(self, **kwargs):
+            captured.append(kwargs)
+            return SimpleNamespace(output_text='{"status":"ok"}', model="served")
+
+    monkeypatch.setattr(live_test_responses, "Settings", configured_with_graph)
+    monkeypatch.setattr(live_test_responses, "OpenAI", FakeOpenAI)
+
+    assert live_test_responses.main() == 0
+    output = capsys.readouterr().out
+    assert [request["model"] for request in captured] == ["test-chat", "graph-model"]
+    assert "role=graph, requested_model=graph-model" in output
+    assert "text_model=test-chat, graph_model=graph-model, requests=2" in output
 
 
 def test_embeddings_check_validates_vector_and_reports_size(monkeypatch, capsys):

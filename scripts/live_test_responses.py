@@ -23,26 +23,51 @@ def main() -> int:
         print("Responses check failed: OPENAI_API_KEY is missing.", file=sys.stderr)
         return 1
 
+    text_model = str(settings.OPENAI_MODEL or "").strip()
+    graph_model = str(getattr(settings, "OPENAI_GRAPH_MODEL", "") or "").strip()
+    resolved_graph_model = graph_model or text_model
+    # The fallback uses the same request once; a distinct configured graph model
+    # gets its own compatibility check.
+    models = list(dict.fromkeys([text_model, resolved_graph_model]))
+
     try:
         client = OpenAI(
             api_key=settings.OPENAI_API_KEY,
             base_url=settings.OPENAI_BASE_URL.rstrip("/"),
         )
-        response = client.responses.create(
-            model=settings.OPENAI_MODEL,
-            input=[
-                {
-                    "role": "system",
-                    "content": "Return only one valid JSON object with a status field.",
-                },
-                {"role": "user", "content": 'Set "status" to "ok".'},
-            ],
-            max_output_tokens=64,
-            text={"format": {"type": "json_object"}},
+        for model in models:
+            response = client.responses.create(
+                model=model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": "Return only one valid JSON object with a status field.",
+                    },
+                    {"role": "user", "content": 'Set "status" to "ok".'},
+                ],
+                max_output_tokens=64,
+                text={"format": {"type": "json_object"}},
+            )
+            payload: Any = json.loads(response.output_text)
+            if not isinstance(payload, dict) or not payload:
+                raise ValueError(
+                    f"Responses API did not return a non-empty JSON object for {model}."
+                )
+            response_model = getattr(response, "model", "")
+            served_model = (
+                f", response_model={response_model}"
+                if isinstance(response_model, str) and response_model
+                else ""
+            )
+            role = "text" if model == settings.OPENAI_MODEL else "graph"
+            print(
+                "Responses check passed: "
+                f"role={role}, requested_model={model}, json_keys={len(payload)}{served_model}"
+            )
+        print(
+            "Responses model routing: "
+            f"text_model={text_model}, graph_model={resolved_graph_model}, requests={len(models)}"
         )
-        payload: Any = json.loads(response.output_text)
-        if not isinstance(payload, dict) or not payload:
-            raise ValueError("Responses API did not return a non-empty JSON object.")
     except Exception as error:
         print(
             "Responses check failed: "
@@ -50,17 +75,6 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-
-    response_model = getattr(response, "model", "")
-    served_model = (
-        f", response_model={response_model}"
-        if isinstance(response_model, str) and response_model
-        else ""
-    )
-    print(
-        "Responses check passed: "
-        f"requested_model={settings.OPENAI_MODEL}, json_keys={len(payload)}{served_model}"
-    )
     return 0
 
 

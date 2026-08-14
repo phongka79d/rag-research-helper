@@ -17,7 +17,8 @@ from core.schemas import (
     GraphEdgeVerificationResult,
     HypotheticalQA,
     MAX_GRAPH_VERIFIER_CANDIDATES,
-    SectionAOTResult,
+    SectionGraphResult,
+    SectionPlanResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,10 @@ class LLMService:
             base_url=settings.OPENAI_BASE_URL.rstrip("/"),
         )
         self.model = settings.OPENAI_MODEL
+        configured_graph_model = str(
+            getattr(settings, "OPENAI_GRAPH_MODEL", "") or ""
+        ).strip()
+        self.graph_model = configured_graph_model or self.model
         self.embedding_model = settings.OPENAI_EMBEDDING_MODEL
         self._jina_api_key = str(getattr(settings, "JINA_API_KEY", "") or "")
         self._jina_rerank_url = str(
@@ -78,9 +83,10 @@ class LLMService:
         user: str,
         max_output_tokens: int | None = None,
         json_output: bool = False,
+        model: str | None = None,
     ) -> str:
         request: dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "input": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -157,20 +163,48 @@ class LLMService:
             )
         return [[float(value) for value in vector] for vector in vectors]
 
-    def extract_section_plan_and_graph(
-        self, section_text: str, existing_nodes: list[str]
-    ) -> dict[str, Any]:
-        system = (
+    @staticmethod
+    def _section_extraction_system() -> str:
+        return (
             "You are a research-paper extraction API. Return only one valid JSON object. "
             "Do not add markdown or commentary."
         )
-        user = f"""
+
+    def _section_plan_prompt(
+        self, section_text: str, existing_nodes: list[str]
+    ) -> str:
+        return f"""
 Analyze this research-paper section and return exactly this JSON shape:
 {{
   "main_entities": ["concept"],
   "learning_roadmap": [
     {{"title": "step title", "content_focus": "what to explain", "concepts": ["concept"]}}
-  ],
+  ]
+}}
+
+Rules:
+- Produce 2 to 4 broad learning-roadmap steps when the section has enough material.
+- The existing concept list contains terms from earlier sections of this same paper only.
+  When a current-section spelling differs from an existing name only by letter case, reuse
+  that earlier exact spelling. Do not merge names by removing whitespace or punctuation.
+- Every main entity and roadmap concept must occur in this current source section (case and
+  punctuation may differ). Do not use concepts from another paper or infer a named concept
+  that is absent from the text.
+- Ground roadmap titles and content_focus in the source text; do not add outside facts.
+
+Existing concept names:
+{json.dumps(existing_nodes, ensure_ascii=False)}
+
+Source section:
+{section_text}
+""".strip()
+
+    def _section_graph_prompt(
+        self, section_text: str, existing_nodes: list[str]
+    ) -> str:
+        return f"""
+Analyze this research-paper section and return exactly this JSON shape:
+{{
   "knowledge_graph": {{
     "nodes": [{{"name": "concept", "description": "one-sentence description"}}],
     "edges": [{{"source": "concept", "relation": "PREREQUISITE_OF", "target": "concept"}}]
@@ -178,7 +212,6 @@ Analyze this research-paper section and return exactly this JSON shape:
 }}
 
 Rules:
-- Produce 2 to 4 broad learning-roadmap steps when the section has enough material.
 - Use only PREREQUISITE_OF, RELATES_TO, PART_OF, or DESCRIBES for relations.
 - A PREREQUISITE_OF B means the source explicitly says understanding A is required
   before understanding B; architectural reliance is not a learning prerequisite. A PART_OF
@@ -209,11 +242,10 @@ Rules:
 - The existing concept list contains terms from earlier sections of this same paper only.
   When a current-section spelling differs from an existing name only by letter case, reuse
   that earlier exact spelling. Do not merge names by removing whitespace or punctuation.
-- Every main entity, roadmap concept, graph node name, and graph-edge endpoint must
-  occur in this current source section (case and punctuation may differ). Do not use
-  concepts from another paper or infer a named concept that is absent from the text.
-- Ground descriptions, roadmap titles, and content_focus in the source text; do not
-  add outside facts.
+- Every graph node name and graph-edge endpoint must occur in this current source section
+  (case and punctuation may differ). Do not use concepts from another paper or infer a
+  named concept that is absent from the text.
+- Ground descriptions in the source text; do not add outside facts.
 
 Existing concept names:
 {json.dumps(existing_nodes, ensure_ascii=False)}
@@ -221,10 +253,43 @@ Existing concept names:
 Source section:
 {section_text}
 """.strip()
-        result = SectionAOTResult.model_validate(
-            self._json_object(self._chat(system, user, json_output=True))
+
+    def extract_section_plan(
+        self, section_text: str, existing_nodes: list[str]
+    ) -> dict[str, Any]:
+        result = SectionPlanResult.model_validate(
+            self._json_object(
+                self._chat(
+                    self._section_extraction_system(),
+                    self._section_plan_prompt(section_text, existing_nodes),
+                    json_output=True,
+                )
+            )
         )
         return result.model_dump()
+
+    def extract_section_graph(
+        self, section_text: str, existing_nodes: list[str]
+    ) -> dict[str, Any]:
+        result = SectionGraphResult.model_validate(
+            self._json_object(
+                self._chat(
+                    self._section_extraction_system(),
+                    self._section_graph_prompt(section_text, existing_nodes),
+                    json_output=True,
+                    model=self.graph_model,
+                )
+            )
+        )
+        return result.model_dump()
+
+    def extract_section_plan_and_graph(
+        self, section_text: str, existing_nodes: list[str]
+    ) -> dict[str, Any]:
+        """Compatibility wrapper preserving the historical merged AOT shape."""
+        plan = self.extract_section_plan(section_text, existing_nodes)
+        graph = self.extract_section_graph(section_text, existing_nodes)
+        return {**plan, **graph}
 
     def verify_graph_edges(
         self, section_text: str, candidates: list[dict[str, str]]
@@ -293,6 +358,7 @@ Source section:
                     user,
                     max_output_tokens=GRAPH_VERIFIER_MAX_OUTPUT_TOKENS,
                     json_output=True,
+                    model=self.graph_model,
                 )
             )
         )
@@ -343,6 +409,7 @@ Source section:
                     user,
                     max_output_tokens=GRAPH_RECOVERY_MAX_OUTPUT_TOKENS,
                     json_output=True,
+                    model=self.graph_model,
                 )
             )
         )
