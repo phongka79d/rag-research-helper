@@ -338,12 +338,11 @@ def expected_result(
     ingested: list[str], skipped: list[str], graph_relationships: dict | None = None
 ) -> dict:
     if graph_relationships is None:
-        # SECTION_TEXT local scan yields the direct PART_OF span plus one
-        # same-paragraph adjacent window; the gate keeps one triple and prefers
-        # the single-span evidence id.
+        # SECTION_TEXT local scan yields a PART_OF triple (single-span preferred
+        # over the adjacent window); the model duplicate is dropped at union.
         graph_relationships = {
-            "candidates": 2 * int(bool(ingested)),
-            "verifier_approvals": 2 * int(bool(ingested)),
+            "candidates": 1 * int(bool(ingested)),
+            "verifier_approvals": 1 * int(bool(ingested)),
             "retained": 1 * int(bool(ingested)),
         }
         if ingested:
@@ -366,8 +365,10 @@ def expected_result(
 
 
 def test_markdown_sections_keep_order_and_metadata():
+    abstract = "A summary. " + ("Background context for the abstract. " * 8)
+    method = "The method text. " + ("Details of the procedure follow here. " * 8)
     sections = DocumentProcessor().process_markdown(
-        "# Test Paper\n\n## Abstract\nA summary.\n\n## Method\nThe method text.\n",
+        f"# Test Paper\n\n## Abstract\n{abstract}\n\n## Method\n{method}\n",
         "paper.md",
     )
 
@@ -1117,9 +1118,8 @@ def test_graph_without_candidate_edges_skips_verifier():
 
 
 def test_ingestion_reports_graph_candidate_approval_and_retained_counts():
-    # One PART_OF local candidate plus a co-occurrence sentence that yields no
-    # extra mapped edge. Approve only index 0 so the adjacent-window duplicate
-    # is not retained.
+    # Local scan may emit single-span and window copies of one PART_OF triple;
+    # union keeps the preferred single-span candidate only.
     text = "Alpha is part of Beta. Gamma and Delta appear together."
     local_candidates, _extra = propose_local_graph_candidates(text)
     assert len(local_candidates) == 2
@@ -1142,7 +1142,7 @@ def test_ingestion_reports_graph_candidate_approval_and_retained_counts():
         processor=FakeProcessor(sections=[make_section(text=text)]),
     )
 
-    assert result["graph_relationships"]["candidates"] == 2
+    assert result["graph_relationships"]["candidates"] == 1
     assert result["graph_relationships"]["retained"] >= 1
     assert result["graph_relationships"]["retained_edge_audit"][0]["source"] == "Alpha"
     assert result["graph_relationships"]["retained_edge_audit"][0]["target"] == "Beta"
@@ -1438,19 +1438,24 @@ def test_graph_gate_rejection_reasons_distinguish_evidence_failures():
 
 def test_graph_verifier_request_caps_candidates_conservatively():
     # Empty local scan so the model edge list is the candidate source.
-    text = "The system and the technique appear together."
-    edge = {
-        "source": "technique",
-        "target": "system",
-        "relation": "PART_OF",
-        "evidence_id": "e0",
-    }
+    # Distinct grounded triples: union dedupes identical (source, relation, target).
+    names = [f"Entity{index}" for index in range(MAX_GRAPH_VERIFIER_CANDIDATES + 1)]
+    text = " and ".join(names) + " appear together."
+    edges = [
+        {
+            "source": names[index],
+            "target": names[(index + 1) % len(names)],
+            "relation": "PART_OF",
+            "evidence_id": "e0",
+        }
+        for index in range(len(names))
+    ]
     aot = {
-        "main_entities": ["system", "technique"],
+        "main_entities": names[:2],
         "learning_roadmap": [],
         "knowledge_graph": {
-            "nodes": [{"name": "system"}, {"name": "technique"}],
-            "edges": [dict(edge) for _ in range(MAX_GRAPH_VERIFIER_CANDIDATES + 1)],
+            "nodes": [{"name": name} for name in names],
+            "edges": edges,
         },
     }
     llm = FakeLLM(aot=aot)
@@ -1555,7 +1560,8 @@ def test_section_dedups_single_span_and_window_to_one_edge():
         "relation": "PART_OF",
         "target": "LoRA",
     }
-    assert result["graph_relationships"]["candidates"] == len(local_candidates)
+    # Union prefers local single-span; window and model duplicates are one triple.
+    assert result["graph_relationships"]["candidates"] == 1
     assert result["graph_relationships"]["retained"] == 1
     audit = result["graph_relationships"]["retained_edge_audit"]
     assert len(audit) == 1
@@ -1898,14 +1904,14 @@ def test_split_plan_graph_and_questions_overlap_and_merge_without_context_aliasi
 
     assert result == expected_result(["lora.md::Method"], [])
     assert llm.plan_started.is_set()
-    # SECTION_TEXT has local PART_OF candidates: graph extractor and verifier
-    # are skipped; the local matcher already grounded the edges.
-    assert llm.graph_calls == 0
-    assert not llm.graph_started.is_set()
+    # Non-thin sections always extract a graph; local PART_OF is auto-approved
+    # and the model duplicate of that triple does not reach the verifier.
+    assert llm.graph_calls == 1
+    assert llm.graph_started.is_set()
     assert llm.verify_calls == []
     assert llm.questions_started.is_set()
     assert llm.plan_node_calls == [[]]
-    assert llm.graph_node_calls == []
+    assert llm.graph_node_calls == [[]]
     assert dag.saved[0]["edges"] == [
         {
             "source": "low-rank matrix",
@@ -1956,12 +1962,21 @@ def test_split_graph_runs_when_local_scan_is_empty():
 
 
 def test_local_part_of_candidates_persist_without_verifier():
-    """Matcher-grounded local candidates skip the verifier and still persist."""
+    """Local candidates auto-approve; extractor still runs on non-thin bodies."""
     text = _ensure_graph_body(
         "A compact update is a component of the adapter method."
     )
     local_candidates, _extra = propose_local_graph_candidates(text)
     assert local_candidates
+    # Unique triples after union (single-span preferred over window).
+    unique_local = {
+        (
+            item["source"].casefold(),
+            item["relation"],
+            item["target"].casefold(),
+        )
+        for item in local_candidates
+    }
     llm = SplitExtractionLLM()
     llm.aot = {
         "main_entities": ["compact update", "adapter method"],
@@ -1991,12 +2006,189 @@ def test_local_part_of_candidates_persist_without_verifier():
         processor=FakeProcessor(sections=[make_section(text=text)]),
     )
 
-    assert llm.graph_calls == 0
+    assert llm.graph_calls == 1
     assert llm.verify_calls == []
     assert dag.saved[0]["edges"]
     assert all("evidence_id" not in edge for edge in dag.saved[0]["edges"])
-    assert result["graph_relationships"]["candidates"] == len(local_candidates)
+    assert result["graph_relationships"]["candidates"] == len(unique_local)
     assert result["graph_relationships"]["retained"] >= 1
+
+
+def test_extractor_runs_when_local_candidates_exist_on_non_thin_section():
+    """Local hits must not skip extract_section_graph on non-thin bodies."""
+    text = _ensure_graph_body(
+        "A compact update is a component of the adapter method."
+    )
+    assert propose_local_graph_candidates(text)[0]
+    llm = SplitExtractionLLM()
+    llm.aot = {
+        "main_entities": ["compact update", "adapter method"],
+        "learning_roadmap": [
+            {
+                "title": "Mechanism",
+                "content_focus": text,
+                "concepts": ["compact update", "adapter method"],
+            }
+        ],
+        "knowledge_graph": {
+            "nodes": [
+                {"name": "compact update"},
+                {"name": "adapter method"},
+            ],
+            "edges": [],
+        },
+    }
+
+    ingest_document(
+        "ignored.md",
+        FakeStore(),
+        llm,
+        FakeDAG(),
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert llm.graph_calls == 1
+    assert llm.graph_started.is_set()
+
+
+def test_union_keeps_local_part_of_and_distinct_model_edge():
+    """Local PART_OF and a different grounded model edge may both persist."""
+    text = _ensure_graph_body(
+        "A compact update is a component of the adapter method. "
+        "QLoRA fine-tunes LLaMA."
+    )
+    spans = build_evidence_spans(text)
+    fine_tune_span = next(
+        span for span in spans if "fine-tunes" in span["text"]
+    )
+    local_candidates, _extra = propose_local_graph_candidates(text)
+    assert any(item["relation"] == "PART_OF" for item in local_candidates)
+    llm = SplitExtractionLLM()
+    llm.aot = {
+        "main_entities": [
+            "compact update",
+            "adapter method",
+            "QLoRA",
+            "LLaMA",
+        ],
+        "learning_roadmap": [
+            {
+                "title": "Mechanism",
+                "content_focus": text,
+                "concepts": [
+                    "compact update",
+                    "adapter method",
+                    "QLoRA",
+                    "LLaMA",
+                ],
+            }
+        ],
+        "knowledge_graph": {
+            "nodes": [
+                {"name": "compact update"},
+                {"name": "adapter method"},
+                {"name": "QLoRA"},
+                {"name": "LLaMA"},
+            ],
+            "edges": [
+                {
+                    "source": "QLoRA",
+                    "relation": "FINE_TUNES",
+                    "target": "LLaMA",
+                    "evidence_id": fine_tune_span["id"],
+                }
+            ],
+        },
+    }
+    dag = FakeDAG()
+
+    result = ingest_document(
+        "ignored.md",
+        FakeStore(),
+        llm,
+        dag,
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert llm.graph_calls == 1
+    assert len(llm.verify_calls) == 1
+    assert len(llm.verify_calls[0][1]) == 1
+    assert llm.verify_calls[0][1][0]["relation"] == "FINE_TUNES"
+    edge_keys = {
+        (edge["source"], edge["relation"], edge["target"])
+        for edge in dag.saved[0]["edges"]
+    }
+    assert (
+        "compact update",
+        "PART_OF",
+        "adapter method",
+    ) in edge_keys or any(
+        edge["relation"] == "PART_OF" for edge in dag.saved[0]["edges"]
+    )
+    assert any(
+        edge["relation"] == "FINE_TUNES"
+        and edge["source"] == "QLoRA"
+        and edge["target"] == "LLaMA"
+        for edge in dag.saved[0]["edges"]
+    )
+    assert result["graph_relationships"]["candidates"] == 2
+    assert result["graph_relationships"]["retained"] == 2
+
+
+def test_union_drops_model_duplicate_of_local_triple():
+    """Model edge matching a local normalized triple is not double-counted."""
+    text = _ensure_graph_body(
+        "A compact update is a component of the adapter method."
+    )
+    local_candidates, _extra = propose_local_graph_candidates(text)
+    assert local_candidates
+    local_edge = next(
+        item for item in local_candidates if "+" not in item["evidence_id"]
+    )
+    llm = SplitExtractionLLM()
+    llm.aot = {
+        "main_entities": [local_edge["source"], local_edge["target"]],
+        "learning_roadmap": [
+            {
+                "title": "Mechanism",
+                "content_focus": text,
+                "concepts": [local_edge["source"], local_edge["target"]],
+            }
+        ],
+        "knowledge_graph": {
+            "nodes": [
+                {"name": local_edge["source"]},
+                {"name": local_edge["target"]},
+            ],
+            "edges": [
+                {
+                    # Different casing/surface form; same normalized triple.
+                    "source": local_edge["source"].title(),
+                    "relation": local_edge["relation"],
+                    "target": local_edge["target"].title(),
+                    "evidence_id": local_edge["evidence_id"],
+                }
+            ],
+        },
+    }
+    dag = FakeDAG()
+
+    result = ingest_document(
+        "ignored.md",
+        FakeStore(),
+        llm,
+        dag,
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    assert llm.graph_calls == 1
+    assert llm.verify_calls == []
+    assert result["graph_relationships"]["candidates"] == 1
+    assert len(dag.saved[0]["edges"]) == 1
+    assert dag.saved[0]["edges"][0]["relation"] == "PART_OF"
+    # Local surface form preferred over the model duplicate.
+    assert dag.saved[0]["edges"][0]["source"] == local_edge["source"]
+    assert dag.saved[0]["edges"][0]["target"] == local_edge["target"]
 
 
 def test_split_graph_failure_persists_section_without_edges():
@@ -2073,8 +2265,8 @@ def test_middle_section_graph_failure_does_not_block_later_section():
     )
 
     assert result["ingested"] == ["lora.md::Usage", "lora.md::Method"]
-    # Co-occurrence section forced the graph path once; Method used local candidates.
-    assert llm.graph_calls == 1
+    # Both non-thin sections request graph extract; Usage fails, Method succeeds.
+    assert llm.graph_calls == 2
     assert len(dag.saved) == 2
     assert dag.saved[0]["edges"] == []
     assert dag.saved[0]["source"]["section"] == "Usage"

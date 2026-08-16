@@ -214,11 +214,11 @@ def test_question_retrieval_builds_five_unique_candidates_from_25_hits(monkeypat
         ]
         candidates = rerank_calls[0][1]
         assert [candidate["parent_id"] for candidate in candidates] == parent_ids[:5]
-        assert candidates[0] == {
-            "question": "first question",
-            "parent_id": parent_ids[0],
-            "key_knowledge": "first knowledge",
-        }
+        assert candidates[0]["question"] == "first question"
+        assert candidates[0]["parent_id"] == parent_ids[0]
+        assert candidates[0]["key_knowledge"] == "first knowledge"
+        assert "section_heading" in candidates[0]
+        assert "body_preview" in candidates[0]
         assert [section["metadata"]["parent_id"] for section in sections] == parent_ids[:2]
     finally:
         delete_store(store)
@@ -248,10 +248,43 @@ def test_question_retrieval_fuses_reranker_first_with_vector_top(monkeypatch):
             parent_ids[1],
             parent_ids[0],
         ]
+        assert len(sections) == 2
         assert [section["metadata"]["matched_knowledge"] for section in sections] == [
             "knowledge reranker-top",
             "knowledge vector-top",
         ]
+    finally:
+        delete_store(store)
+
+
+def test_question_retrieval_llm_top_not_vector_top_stays_at_two_parents(monkeypatch):
+    store = make_store()
+    try:
+        parent_ids = ["vector-top", "second", "llm-top", "fourth", "fifth"]
+        stub_question_retrieval(
+            monkeypatch,
+            store,
+            [question_point(parent_id) for parent_id in parent_ids],
+            [],
+        )
+        monkeypatch.setattr(
+            store.llm,
+            "cascade_rerank_candidate_questions",
+            lambda query, candidates, limit=2: (
+                [parent_ids[2], parent_ids[1]],
+                "llm",
+            ),
+            raising=False,
+        )
+
+        sections = store.search_candidates_and_fetch_parent("How does it work?", store.llm)
+
+        assert [section["metadata"]["parent_id"] for section in sections] == [
+            parent_ids[2],
+            parent_ids[0],
+        ]
+        assert len(sections) == 2
+        assert sections[0]["metadata"]["_rerank_source"] == "llm"
     finally:
         delete_store(store)
 

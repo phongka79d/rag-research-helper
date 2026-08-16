@@ -12,6 +12,7 @@ CURRICULUM_COLLECTION = "research_curriculum"
 QUESTIONS_COLLECTION = "research_questions"
 MAX_QDRANT_SEARCH_LIMIT = 25
 MAX_QDRANT_CANDIDATE_PARENTS = 5
+PARENT_BODY_PREVIEW_CHARS = 400
 RERANK_SOURCES = {"jina", "llm_fallback", "llm", "vector"}
 
 
@@ -412,11 +413,33 @@ class QdrantVectorStore:
         if not candidates:
             return []
 
+        # Fetch unique parents before ranking so the LLM sees heading + body preview.
+        parent_sections: dict[str, dict[str, Any]] = {}
+        ranking_candidates: list[dict[str, str]] = []
+        for candidate in candidates:
+            parent_id = candidate["parent_id"]
+            section = self._fetch_parent(parent_id)
+            heading = ""
+            preview = ""
+            if section is not None:
+                parent_sections[parent_id] = section
+                metadata = section.get("metadata") or {}
+                heading = str(metadata.get("section", "") or "")
+                body = str(section.get("page_content", "") or "")
+                preview = body[:PARENT_BODY_PREVIEW_CHARS]
+            ranking_candidates.append(
+                {
+                    **candidate,
+                    "section_heading": heading,
+                    "body_preview": preview,
+                }
+            )
+
         rerank_source = "vector"
         reranked_ids: list[str] = []
         cascade = getattr(llm_service, "cascade_rerank_candidate_questions", None)
         if callable(cascade):
-            cascade_result = cascade(query, candidates)
+            cascade_result = cascade(query, ranking_candidates)
             if isinstance(cascade_result, tuple) and len(cascade_result) == 2:
                 candidate_ids, candidate_source = cascade_result
                 if isinstance(candidate_ids, list):
@@ -425,7 +448,9 @@ class QdrantVectorStore:
                     rerank_source = candidate_source
         else:
             # Ponytail: lightweight legacy test doubles retain the old public method.
-            reranked_ids = llm_service.rerank_candidate_questions(query, candidates)
+            reranked_ids = llm_service.rerank_candidate_questions(
+                query, ranking_candidates
+            )
             legacy_source = getattr(llm_service, "_last_rerank_source", "")
             rerank_source = (
                 legacy_source
@@ -455,7 +480,9 @@ class QdrantVectorStore:
 
         sections = []
         for parent_id in parent_ids:
-            section = self._fetch_parent(parent_id)
+            section = parent_sections.get(parent_id)
+            if section is None:
+                section = self._fetch_parent(parent_id)
             if section is None:
                 continue
             section["metadata"]["matched_knowledge"] = candidates_by_parent[parent_id].get(

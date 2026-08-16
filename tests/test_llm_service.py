@@ -713,6 +713,23 @@ def test_hypothetical_questions_adds_grounded_title_context_only_when_supplied()
     assert "do not restate the heading topic in\nmultiple overview questions" in prompt
 
 
+def test_hypothetical_questions_prompt_prefers_distinct_supported_kinds():
+    service = make_service()
+    service.client = FakeClient(response_texts=['{"qa_pairs":[]}'])
+
+    service.generate_hypothetical_questions(
+        "Method X freezes base weights and reports a 2x speedup over baseline.",
+        5,
+    )
+
+    prompt = service.client.responses.calls[0]["input"][1]["content"]
+    assert "overview" in prompt
+    assert "numeric/factual" in prompt
+    assert "relation/comparison" in prompt
+    assert "process/method" in prompt
+    assert "Do not invent a kind" in prompt
+
+
 def test_hypothetical_questions_reject_more_than_requested_max():
     service = make_service()
     service.client = FakeClient(
@@ -923,6 +940,47 @@ def test_close_jina_scores_use_llm_fallback(monkeypatch):
         ["second"],
         "llm_fallback",
     )
+
+
+def test_confident_jina_order_is_overridden_by_valid_llm_parent_rank(monkeypatch):
+    service = make_service()
+    service._jina_api_key = "jina-secret"
+    service.client = FakeClient(
+        response_texts=['{"best_parent_ids":["llm-first", "jina-first"]}']
+    )
+    monkeypatch.setattr(
+        llm_service.urllib.request,
+        "urlopen",
+        lambda request, timeout: FakeHTTPResponse(
+            '{"results":[{"index":0,"relevance_score":0.95},'
+            '{"index":1,"relevance_score":0.20}]}'
+        ),
+    )
+    candidates = [
+        {
+            "question": "wording match",
+            "parent_id": "jina-first",
+            "key_knowledge": "",
+            "section_heading": "Unrelated setup",
+            "body_preview": "Hardware details only.",
+        },
+        {
+            "question": "other wording",
+            "parent_id": "llm-first",
+            "key_knowledge": "",
+            "section_heading": "Results",
+            "body_preview": "Accuracy improves by 12% on the benchmark.",
+        },
+    ]
+
+    assert service.cascade_rerank_candidate_questions("query", candidates) == (
+        ["llm-first", "jina-first"],
+        "llm_fallback",
+    )
+    llm_prompt = service.client.responses.calls[0]["input"][1]["content"]
+    assert "section_heading" in llm_prompt
+    assert "body_preview" in llm_prompt
+    assert "Candidate parent sections" in llm_prompt
 
 
 def test_cascade_reports_llm_and_vector_provenance(monkeypatch):

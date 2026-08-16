@@ -35,6 +35,8 @@ COMMON_PAPER_HEADINGS = {
     "references",
     "appendix",
 }
+# Same threshold as thin-section graph skip in data_ingestion.
+STUB_BODY_MAX_CHARS = 200
 
 
 class DocumentProcessor:
@@ -155,6 +157,7 @@ class DocumentProcessor:
             else:
                 lines.append(line)
         flush()
+        sections = self._merge_stub_sections(sections)
         sections = self._with_sequence_ids(sections)
         self._set_report(sections, bibliography_omitted=False)
         return sections
@@ -171,6 +174,7 @@ class DocumentProcessor:
         lines: list[str] = []
         body_started = False
         bibliography_omitted = False
+        in_bibliography = False
 
         def flush() -> None:
             content = "\n".join(lines).strip()
@@ -196,7 +200,13 @@ class DocumentProcessor:
                 if self._is_references_heading(heading) and body_started:
                     flush()
                     bibliography_omitted = True
-                    break
+                    in_bibliography = True
+                    continue
+                if in_bibliography:
+                    if self._is_mineru_section_heading(heading):
+                        in_bibliography = False
+                        title = heading
+                    continue
                 if not body_started:
                     if self._is_mineru_body_start(heading):
                         body_started = True
@@ -210,9 +220,10 @@ class DocumentProcessor:
                     # preserve its text in the surrounding section.
                     lines.append(heading)
                 continue
-            if body_started:
+            if body_started and not in_bibliography:
                 lines.append(line)
         flush()
+        sections = self._merge_stub_sections(sections)
         sections = self._with_sequence_ids(sections)
         self._set_report(
             sections,
@@ -302,6 +313,31 @@ class DocumentProcessor:
         for seq_id, section in enumerate(sections):
             section["metadata"]["seq_id"] = seq_id
         return sections
+
+    @staticmethod
+    def _merge_stub_sections(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fold bodies under STUB_BODY_MAX_CHARS into the following section."""
+        if not sections:
+            return sections
+        merged: list[dict[str, Any]] = []
+        pending: list[str] = []
+        last_index = len(sections) - 1
+        for index, section in enumerate(sections):
+            body = section["page_content"].strip()
+            is_stub = len(body) < STUB_BODY_MAX_CHARS
+            if is_stub and index < last_index:
+                heading = str(section["metadata"].get("section", "")).strip()
+                pending.append(f"{heading}\n{body}" if body else heading)
+                continue
+            if pending:
+                prefix = "\n".join(pending)
+                section = {
+                    "page_content": f"{prefix}\n{section['page_content']}".strip(),
+                    "metadata": dict(section["metadata"]),
+                }
+                pending = []
+            merged.append(section)
+        return merged
 
     @staticmethod
     def _is_pdf_heading(line: str) -> bool:

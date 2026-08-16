@@ -490,8 +490,10 @@ multiple overview questions.
         )
         user = f"""
 Generate up to {num_questions} distinct hypothetical user questions that this raw
-research-paper section can answer. Include factual questions when the source contains
-values, methods, or experimental details. Return:
+research-paper section can answer. Prefer distinct supported kinds among: overview
+(at most one; see heading rules), numeric/factual detail, relation/comparison, and
+process/method. Do not invent a kind this section does not support, and do not pad
+with restatements of the same fact. Return:
 {{
   "qa_pairs": [
     {{"question": "...", "key_knowledge": "one or two grounded sentences"}}
@@ -644,6 +646,31 @@ Raw source section:
         except (TypeError, ValueError):
             return True
 
+    @staticmethod
+    def _preorder_candidates_by_parent_ids(
+        candidates: list[dict[str, str]],
+        parent_ids: list[str],
+    ) -> list[dict[str, str]]:
+        """Stable pre-order: named parents first, then remaining candidates."""
+        by_parent: dict[str, dict[str, str]] = {}
+        for candidate in candidates:
+            parent_id = candidate.get("parent_id", "")
+            if parent_id and parent_id not in by_parent:
+                by_parent[parent_id] = candidate
+        ordered: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for parent_id in parent_ids:
+            candidate = by_parent.get(parent_id)
+            if candidate is not None and parent_id not in seen:
+                ordered.append(candidate)
+                seen.add(parent_id)
+        for candidate in candidates:
+            parent_id = candidate.get("parent_id", "")
+            if parent_id and parent_id not in seen:
+                ordered.append(candidate)
+                seen.add(parent_id)
+        return ordered or list(candidates)
+
     def cascade_rerank_candidate_questions(
         self,
         user_query: str,
@@ -655,7 +682,7 @@ Raw source section:
         limit = max(1, min(limit, len(candidates)))
         try:
             jina_result = self.jina_rerank_candidate_questions(
-                user_query, candidates, limit=limit
+                user_query, candidates, limit=len(candidates)
             )
         except Exception as error:
             logger.warning(
@@ -663,6 +690,7 @@ Raw source section:
                 _safe_provider_error(error, self._jina_api_key),
             )
             jina_result = None
+        ordered_candidates = candidates
         if jina_result is not None:
             parent_ids = jina_result.get("parent_ids", []) if isinstance(jina_result, dict) else []
             scores = jina_result.get("scores", []) if isinstance(jina_result, dict) else []
@@ -678,21 +706,13 @@ Raw source section:
                     for score in scores
                 )
             )
-            if (
-                valid_result
-                and parent_ids
-                and len(parent_ids) >= limit
-                and not self._jina_scores_uncertain(scores)
-            ):
-                return parent_ids[:limit], "jina"
-            llm_ids, llm_source = self._rerank_candidate_questions_with_source(
-                user_query, candidates, limit=limit
-            )
-            if llm_source == "llm":
-                return llm_ids[:limit], "llm_fallback"
-            return llm_ids[:limit], "vector"
+            # Jina may pre-order HyDE hits; it is never the sole final rank when LLM is valid.
+            if valid_result and parent_ids:
+                ordered_candidates = self._preorder_candidates_by_parent_ids(
+                    candidates, parent_ids
+                )
         reranked_ids, source = self._rerank_candidate_questions_with_source(
-            user_query, candidates, limit=limit
+            user_query, ordered_candidates, limit=limit
         )
         if source == "llm" and self._jina_api_key:
             source = "llm_fallback"
@@ -709,8 +729,37 @@ Raw source section:
             self._last_rerank_source = "vector"
             return [], "vector"
         limit = max(1, min(limit, len(candidates)))
-        system = "You select the best matching research questions. Return only valid JSON."
-        user = f"""
+        has_section_context = any(
+            (candidate.get("section_heading") or candidate.get("body_preview"))
+            for candidate in candidates
+        )
+        if has_section_context:
+            ranking_items = [
+                {
+                    "parent_id": candidate.get("parent_id", ""),
+                    "section_heading": candidate.get("section_heading", ""),
+                    "body_preview": candidate.get("body_preview", ""),
+                }
+                for candidate in candidates
+            ]
+            system = (
+                "You select the best parent sections for a research question. "
+                "Return only valid JSON."
+            )
+            user = f"""
+User query:
+{user_query}
+
+Candidate parent sections:
+{json.dumps(ranking_items, ensure_ascii=False)}
+
+Return {{"best_parent_ids": ["up to {limit} parent IDs"]}}. Rank parents by how well
+their section heading and body preview answer the user query. Select only IDs present
+in the candidate list, preserve relevance order, and do not repeat an ID.
+""".strip()
+        else:
+            system = "You select the best matching research questions. Return only valid JSON."
+            user = f"""
 User query:
 {user_query}
 

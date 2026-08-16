@@ -538,6 +538,80 @@ def _evidence_id_is_window(evidence_id: str) -> bool:
     return "+" in evidence_id
 
 
+def _candidate_triple_key(candidate: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Normalized (source, relation, target) for union dedup; None if unusable."""
+    source = str(candidate.get("source", "")).strip()
+    target = str(candidate.get("target", "")).strip()
+    relation = normalize_relation(candidate.get("relation"))
+    if not source or not target or not relation:
+        return None
+    return (_normalized_phrase(source), relation, _normalized_phrase(target))
+
+
+def _candidate_evidence_preference(candidate: dict[str, Any], is_local: bool) -> int:
+    """Higher score wins on triple collision; local single-span is best."""
+    evidence_id = str(candidate.get("evidence_id", "") or "").strip()
+    is_window = _evidence_id_is_window(evidence_id)
+    if is_local and not is_window:
+        return 3
+    if is_local:
+        return 2
+    if not is_window:
+        return 1
+    return 0
+
+
+def _union_graph_candidates(
+    local_candidates: list[dict],
+    model_edges: Any,
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """Merge local and model edges; prefer local single-span on triple ties.
+
+    Returns (capped candidates, indexes that came from the local scan).
+    """
+    if not isinstance(model_edges, list):
+        model_edges = []
+    chosen: dict[tuple[str, str, str], tuple[dict[str, Any], bool, int]] = {}
+    order_keys: list[tuple[str, str, str]] = []
+
+    def consider(raw: Any, is_local: bool) -> None:
+        if not isinstance(raw, dict):
+            return
+        key = _candidate_triple_key(raw)
+        if key is None:
+            return
+        candidate = {
+            "source": str(raw.get("source", "")).strip(),
+            "relation": normalize_relation(raw.get("relation")),
+            "target": str(raw.get("target", "")).strip(),
+            "evidence_id": str(raw.get("evidence_id", "") or "").strip(),
+        }
+        pref = _candidate_evidence_preference(candidate, is_local)
+        existing = chosen.get(key)
+        if existing is None:
+            chosen[key] = (candidate, is_local, pref)
+            order_keys.append(key)
+            return
+        if pref > existing[2]:
+            chosen[key] = (candidate, is_local, pref)
+
+    for item in local_candidates:
+        consider(item, True)
+    for item in model_edges:
+        consider(item, False)
+
+    merged: list[dict[str, Any]] = []
+    local_indexes: set[int] = set()
+    for key in order_keys:
+        if len(merged) >= MAX_GRAPH_VERIFIER_CANDIDATES:
+            break
+        candidate, is_local, _pref = chosen[key]
+        if is_local:
+            local_indexes.add(len(merged))
+        merged.append(candidate)
+    return merged, local_indexes
+
+
 def _approved_graph_edges(
     section_text: str,
     candidates: list[dict[str, Any]],
@@ -953,7 +1027,6 @@ def ingest_document(
                 local_candidates: list[dict] = []
                 extra_spans: list[dict] = []
                 gate_spans: list[dict] = []
-                use_local_candidates = False
                 # Plan (or combined plan+graph stripped) + questions only.
                 if callable(plan_extractor):
                     extraction_mode = "thin_plan"
@@ -966,20 +1039,15 @@ def ingest_document(
                     full_text, evidence_spans
                 )
                 gate_spans = list(evidence_spans) + list(extra_spans)
-                use_local_candidates = bool(local_candidates)
-                # Local candidates are the only graph source for this section; skip
-                # extract_section_graph (prefer plan-only when the split boundary exists).
-                if use_local_candidates and callable(plan_extractor):
-                    extraction_mode = "plan_only"
-                elif use_local_candidates:
-                    extraction_mode = "combined_local"
-                elif use_split_extraction:
+                # Non-thin sections always extract a model graph; local scan is
+                # unioned later and does not skip extract_section_graph.
+                if use_split_extraction:
                     extraction_mode = "split"
                 else:
                     extraction_mode = "combined"
             worker_count = 3 if extraction_mode == "split" else 2
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                if extraction_mode in {"plan_only", "thin_plan"}:
+                if extraction_mode == "thin_plan":
                     plan_future = executor.submit(
                         plan_extractor,
                         full_text,
@@ -1009,11 +1077,7 @@ def ingest_document(
                     num_questions=5,
                     section_title=metadata["section"],
                 )
-                if extraction_mode == "plan_only":
-                    aot = _aot_from_plan_and_local_candidates(
-                        plan_future.result(), local_candidates
-                    )
-                elif extraction_mode == "thin_plan":
+                if extraction_mode == "thin_plan":
                     aot = _aot_from_plan_and_local_candidates(plan_future.result(), [])
                 elif extraction_mode == "split":
                     # Plan and questions are independent of graph; an unusable
@@ -1049,34 +1113,48 @@ def ingest_document(
                     graph["edges"] = []
                     graph["nodes"] = []
                 else:
-                    # Ponytail: omit surplus candidates rather than expanding the
-                    # verifier request budget or persisting unverified edges.
-                    # Local non-empty scan replaces model graph edges entirely.
-                    if use_local_candidates:
-                        candidate_edges = local_candidates[
-                            :MAX_GRAPH_VERIFIER_CANDIDATES
-                        ]
-                    else:
-                        candidate_edges = graph.get("edges", [])[
-                            :MAX_GRAPH_VERIFIER_CANDIDATES
-                        ]
+                    # Union local scan + model edges; prefer local single-span
+                    # on the same normalized triple; cap at the verifier bound.
+                    candidate_edges, local_indexes = _union_graph_candidates(
+                        local_candidates, graph.get("edges", [])
+                    )
                     graph_relationships["candidates"] += len(candidate_edges)
-                    # Local scan already applied the same matcher as the gate.
-                    # Calling the verifier (or whole-part recovery) again only
-                    # adds latency and can drop already-grounded edges.
-                    if use_local_candidates:
-                        approvals = [
-                            {"index": index}
-                            for index in range(len(candidate_edges))
+                    # Local matches already passed the wording table; auto-approve
+                    # only those indexes. Verify remaining model candidates and
+                    # map approvals back onto the merged list.
+                    approvals: list[Any] = [
+                        {"index": index} for index in sorted(local_indexes)
+                    ]
+                    model_index_list = [
+                        index
+                        for index in range(len(candidate_edges))
+                        if index not in local_indexes
+                    ]
+                    if model_index_list:
+                        model_only = [
+                            candidate_edges[index] for index in model_index_list
                         ]
-                    elif candidate_edges:
-                        approvals = llm.verify_graph_edges(
+                        model_approvals = llm.verify_graph_edges(
                             full_text,
-                            candidate_edges,
+                            model_only,
                             evidence_spans=gate_spans,
                         )
-                    else:
-                        approvals = []
+                        if isinstance(model_approvals, list):
+                            for approval in model_approvals:
+                                if not isinstance(approval, dict):
+                                    approvals.append(approval)
+                                    continue
+                                raw_index = approval.get("index")
+                                if (
+                                    not isinstance(raw_index, bool)
+                                    and isinstance(raw_index, int)
+                                    and 0 <= raw_index < len(model_index_list)
+                                ):
+                                    approvals.append(
+                                        {"index": model_index_list[raw_index]}
+                                    )
+                                else:
+                                    approvals.append(approval)
                     graph_relationships["verifier_approvals"] += (
                         _verifier_approval_count(candidate_edges, approvals)
                     )
