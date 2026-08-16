@@ -218,7 +218,10 @@ class MinerUFlashClient:
             "PUT",
             file_url,
             data=content,
-            headers={"Content-Type": "application/pdf"},
+            # MinerU's OSS signed URL is generated without a content type.
+            # An empty value prevents urllib from injecting its default form
+            # content type, which would invalidate the signed request.
+            headers={"Content-Type": ""},
             timeout=60,
             endpoint="upload",
         )

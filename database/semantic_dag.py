@@ -209,16 +209,33 @@ class Neo4jManager:
             for key in ("prerequisites", "leads_to", "related_concepts")
         }
 
-    def get_visual_graph(self, locator: str | None = None) -> dict[str, list[dict[str, Any]]]:
-        node_where = "" if locator is None else "WHERE $locator IN coalesce(c.source_locators, [])"
-        edge_where = (
-            ""
-            if locator is None
-            else "WHERE $locator IN coalesce(relationship.source_locators, []) "
-            "OR (relationship.source_locators IS NULL "
-            "AND $locator IN coalesce(source.source_locators, []) "
-            "AND $locator IN coalesce(target.source_locators, []))"
-        )
+    def get_visual_graph(
+        self,
+        locator: str | None = None,
+        *,
+        source: str | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        source_prefix = f"{source}::" if source else ""
+        if source_prefix:
+            node_where = (
+                "WHERE any(loc IN coalesce(c.source_locators, []) "
+                "WHERE loc STARTS WITH $source_prefix)"
+            )
+            edge_where = (
+                "WHERE any(loc IN coalesce(relationship.source_locators, []) "
+                "WHERE loc STARTS WITH $source_prefix)"
+            )
+        elif locator is None:
+            node_where = ""
+            edge_where = ""
+        else:
+            node_where = "WHERE $locator IN coalesce(c.source_locators, [])"
+            edge_where = (
+                "WHERE $locator IN coalesce(relationship.source_locators, []) "
+                "OR (relationship.source_locators IS NULL "
+                "AND $locator IN coalesce(source.source_locators, []) "
+                "AND $locator IN coalesce(target.source_locators, []))"
+            )
         with self.driver.session() as session:
             node_records = session.run(
                 f"""
@@ -231,6 +248,7 @@ class Neo4jManager:
                 ORDER BY id
                 """,
                 locator=locator,
+                source_prefix=source_prefix,
             )
             edge_records = session.run(
                 f"""
@@ -240,6 +258,7 @@ class Neo4jManager:
                 ORDER BY source, target, label
                 """,
                 locator=locator,
+                source_prefix=source_prefix,
             )
             return {
                 "nodes": [dict(record) for record in node_records],

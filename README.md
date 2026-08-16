@@ -57,8 +57,9 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 ### 2. Ingest a PDF or Markdown paper
 
 1. The sidebar in `main.py` saves the uploaded file under `data/papers/`.
-2. `DocumentProcessor` splits PDF or Markdown content into ordered sections with source, section, page, and sequence metadata.
-3. `ingest_document()` in `core/data_ingestion.py` asks `LLMService` for an AOT result: main concepts, a learning roadmap, and a small knowledge graph. Direct whole-part evidence is kept only after source grounding, verifier approval, and the local quote gate; a single bounded graph-only recovery call is used only for a directly cued section that retained no normal edge.
+2. A PDF is extracted with MinerU Flash first (`data/mineru/<name>.md` plus a complete manifest). Incomplete extraction never starts AOT. Markdown is treated as already-extracted text.
+3. `DocumentProcessor.process_mineru_markdown()` (or the Markdown parser) splits the extracted text into ordered sections with source, section, and sequence metadata.
+4. `ingest_document()` in `core/data_ingestion.py` runs the existing AOT path: a learning roadmap, grounded graph candidates (local span scan first, model graph only when needed), HyDE questions, and Neo4j/Qdrant persistence. The local matcher can retain direct whole-part edges; the verifier still reviews model-proposed candidates.
 4. The graph is stored in Neo4j; roadmap steps and full parent sections are stored in `research_curriculum`; up to five directly answerable hypothetical question children are stored in `research_questions` (thin sections may have none).
 5. Each child question keeps its `parent_id`, so retrieval can resolve the complete original section.
 6. The completion result reports graph candidates, verifier approvals, and retained relationships. A zero in any counter is valid and makes an empty Graph tab diagnosable.
@@ -86,10 +87,15 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 ## Architecture
 
 ```text
-PDF / Markdown
-  → DocumentProcessor
-  → AOT extraction (OpenAI)
+PDF
+  → MinerU Flash extract (required)
+  → DocumentProcessor (MinerU Markdown)
+  → AOT extraction (OpenAI) + local graph scan
   → Neo4j Concept graph + Qdrant parent / roadmap / question points
+
+Markdown (already extracted)
+  → DocumentProcessor
+  → same AOT path
 
 Question
   → OpenAI embedding
@@ -195,7 +201,7 @@ docker compose up -d qdrant neo4j
 streamlit run main.py
 ```
 
-Upload a PDF, `.md`, or `.markdown` file in the sidebar. Ingestion uses the configured OpenAI-compatible endpoint and writes the compiled material into the local Qdrant and Neo4j services.
+Upload a PDF, `.md`, or `.markdown` file in the sidebar. PDFs are extracted with MinerU Flash first, then compiled through the same AOT graph pipeline. Markdown skips MinerU. Compilation uses the configured OpenAI-compatible endpoint and writes into the local Qdrant and Neo4j services.
 
 When `OPENAI_GRAPH_MODEL` is set, roadmap and hypothetical-question generation stay on
 `OPENAI_MODEL`; graph extraction, verification, and recovery use the graph model. The
@@ -215,9 +221,46 @@ It uses the no-token signed-upload endpoint, submits contiguous page ranges (def
 IP-rate-limited, accepts files up to 10 MB and 20 pages per request, and returns
 Markdown only. The local PDF is uploaded to MinerU; do not use it for sensitive papers
 without reviewing that privacy implication. A failed batch produces `complete=false`
-and is never silently treated as a complete document. The command does not replace the
-existing parser or write Qdrant/Neo4j data; select the resulting Markdown explicitly if
-you later want to compare ingestion quality.
+and is never silently treated as a complete document. The app PDF ingest path uses this
+same client, then compiles automatically. Running the helper by hand still does not
+write Qdrant/Neo4j.
+
+For a controlled end-to-end comparison on the three supplied papers, run the opt-in
+validation command after Qdrant, Neo4j, and the configured provider are available:
+
+```powershell
+python scripts/validate_mineru_three_papers.py `
+  --input-dir data/papers `
+  --output-dir data/mineru-validation `
+  --batch-size 10 `
+  --workers 1
+```
+
+It processes `attention.pdf`, `qlora_paper.pdf`, and `slm_paper.pdf`, requires every
+MinerU manifest to be complete, stores derived sources such as `mineru_attention.md`
+(default `--source-prefix mineru_`), and writes a comparison report under the selected
+output directory. The original PDF sources are not replaced. The report includes
+parser cleanup, sections compiled this run versus sections skipped as already current,
+source-scoped graph counts and rejection diagnostics, a bounded retained-edge audit
+sample, Qdrant counts, retrieval metrics, and representative Ask source previews. A
+partial extraction or unavailable live dependency makes the overall report incomplete;
+it is not silently treated as a successful comparison.
+
+Optional `--source-prefix` selects the derived-source name prefix (default `mineru_`).
+It must use only letters, digits, and underscore; start with a letter; and end with
+`_`. A distinct prefix creates distinct derived source identities and does not replace
+original PDFs or prior MinerU-derived sources. Example with an isolated evidence run:
+
+```powershell
+python scripts/validate_mineru_three_papers.py `
+  --input-dir data/papers `
+  --output-dir data/mineru-validation-evidence-v2 `
+  --source-prefix mineru_evidence_ `
+  --batch-size 10 `
+  --workers 1
+```
+
+The command does not delete or clean up databases or old sources.
 
 ## Testing and Validation
 
@@ -263,7 +306,7 @@ and latency changes.
 
 ## Known Gaps or Deliberate Limits
 
-- PDF extraction is best-effort `pypdf` text extraction; there is no OCR, layout model, or document-intelligence pipeline.
+- App PDF ingest uses MinerU Flash (layout/OCR Markdown) before AOT. The local PDF is uploaded to MinerU; Flash is IP-rate-limited and accepts files up to 10 MB. Direct `pypdf` remains available only for non-app callers that still call `ingest_document` on a PDF without a manifest.
 - The graph view is a table/list rather than an interactive network visualization, matching the plan’s stated first-version fallback.
 - The app depends on local Qdrant and Neo4j plus a reachable OpenAI-compatible endpoint; it has no offline fallback.
 - AOT extraction quality and answer quality remain model-dependent. The application validates JSON structure and falls back through the optional Jina → LLM → vector rerank cascade when needed.

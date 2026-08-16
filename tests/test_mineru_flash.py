@@ -131,7 +131,7 @@ def test_signed_upload_poll_download_and_ordered_merge(tmp_path):
     assert json.loads(posts[0]["data"].decode())["enable_table"] is False
     puts = [call for call in transport.calls if call["method"] == "PUT"]
     assert len(puts) == 3
-    assert all(call["headers"]["Content-Type"] == "application/pdf" for call in puts)
+    assert all(call["headers"]["Content-Type"] == "" for call in puts)
     assert result["manifest"]["chunks"][1]["task_id"] == "task-11-20"
 
 

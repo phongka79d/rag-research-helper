@@ -17,6 +17,7 @@ class GraphEdge(BaseModel):
     source: str
     target: str
     relation: str = "RELATES_TO"
+    evidence_id: str = Field(min_length=1)
 
     @field_validator("relation")
     @classmethod
@@ -31,7 +32,6 @@ class GraphEdgeApproval(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     index: int = Field(strict=True)
-    quote: str = Field(min_length=1, max_length=500, strict=True)
 
 
 class GraphEdgeVerificationResult(BaseModel):
@@ -45,14 +45,14 @@ class GraphEdgeVerificationResult(BaseModel):
 
 
 class GraphEvidenceEdge(BaseModel):
-    """A strict graph-only recovery candidate with its quoted source evidence."""
+    """A strict graph-only recovery candidate anchored to one evidence span."""
 
     model_config = ConfigDict(extra="forbid")
 
     source: str = Field(min_length=1, strict=True)
     relation: str = Field(strict=True)
     target: str = Field(min_length=1, strict=True)
-    quote: str = Field(min_length=1, max_length=500, strict=True)
+    evidence_id: str = Field(min_length=1, strict=True)
 
     @field_validator("relation")
     @classmethod

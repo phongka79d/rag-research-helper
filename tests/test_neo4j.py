@@ -116,6 +116,10 @@ def test_visual_graph_filters_relationships_by_source_locator():
         assert [(edge["source"], edge["label"], edge["target"]) for edge in second_edges] == [
             (second, "RELATES_TO", first)
         ]
+        paper_edges = manager.get_visual_graph(source=first_source["source"])["edges"]
+        assert [(edge["source"], edge["label"], edge["target"]) for edge in paper_edges] == [
+            (first, "PREREQUISITE_OF", second)
+        ]
 
         manager.remove_source_locator(first_source)
 

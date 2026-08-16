@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 
 import pytest
 from openai import OpenAIError
@@ -8,11 +9,20 @@ import orchestrator.llm_service as llm_service
 from config.settings import Settings
 from orchestrator.llm_service import (
     ANSWER_MAX_OUTPUT_TOKENS,
+    GRAPH_RECOVERY_MAX_OUTPUT_TOKENS,
     GRAPH_VERIFIER_MAX_OUTPUT_TOKENS,
     TEACH_MAX_OUTPUT_TOKENS,
     LLMService,
 )
-from core.schemas import MAX_GRAPH_VERIFIER_CANDIDATES
+from core.schemas import (
+    MAX_GRAPH_VERIFIER_CANDIDATES,
+    GraphEdge,
+    GraphEdgeApproval,
+    GraphEdgeVerificationResult,
+    GraphEvidenceEdge,
+    GraphEvidenceResult,
+    SectionGraphResult,
+)
 
 
 class FakeEmbeddings:
@@ -173,7 +183,7 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
             "```json\n"
             '{"main_entities":["LoRA"],"learning_roadmap":[{"title":"Method","content_focus":"low-rank update","concepts":["LoRA"]}]}\n'
             "```",
-            '{"knowledge_graph":{"nodes":[{"name":"LoRA","description":"adaptation"}],"edges":[{"source":"Matrix","target":"LoRA","relation":"unknown"}]}}',
+            '{"knowledge_graph":{"nodes":[{"name":"LoRA","description":"adaptation"}],"edges":[{"source":"Matrix","target":"LoRA","relation":"unknown","evidence_id":"e0"}]}}',
             '{"qa_pairs":[{"question":"What is LoRA?","key_knowledge":"A low-rank adaptation method."},{"question":"What stays frozen?","key_knowledge":"The base weights."}]}',
         ]
     )
@@ -200,6 +210,8 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     plan_prompt = service.client.responses.calls[0]["input"][1]["content"]
     assert "earlier sections of this same paper" in plan_prompt
     assert "must occur in this current source section" in plan_prompt
+    assert "Source section:\nLoRA freezes base weights." in plan_prompt
+    assert "Numbered source evidence spans:" not in plan_prompt
     graph_prompt = service.client.responses.calls[1]["input"][1]["content"]
     aot_prompt = graph_prompt
     assert "understanding A is required\n  before understanding B" in aot_prompt
@@ -221,6 +233,12 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     assert "relabel an unsupported relation as RELATES_TO" in aot_prompt
     assert "differs from an existing name only by letter case" in aot_prompt
     assert "Do not merge names by removing whitespace or punctuation" in aot_prompt
+    assert '"evidence_id": "e12"' in aot_prompt
+    assert "Numbered source evidence spans:" in aot_prompt
+    assert "[e0] LoRA freezes base weights." in aot_prompt
+    assert "Do not invent an evidence_id" in aot_prompt
+    assert "Both endpoints must appear in that same selected span" in aot_prompt
+    assert "do not paraphrase\n  or rewrite span text" in aot_prompt
 
     qa_prompt = service.client.responses.calls[2]["input"][1]["content"]
     assert "directly and completely answer its question" in qa_prompt
@@ -268,22 +286,221 @@ def test_plan_and_graph_requests_route_to_their_configured_models():
     ]
 
 
-def test_graph_verifier_uses_indexed_immutable_candidates_and_exact_quote_contract():
+def test_graph_edge_and_section_graph_result_accept_evidence_id():
+    edge = GraphEdge(
+        source="component",
+        target="system",
+        relation="PART_OF",
+        evidence_id="e0",
+    )
+    assert edge.evidence_id == "e0"
+
+    result = SectionGraphResult.model_validate(
+        {
+            "knowledge_graph": {
+                "nodes": [{"name": "component", "description": ""}],
+                "edges": [
+                    {
+                        "source": "component",
+                        "target": "system",
+                        "relation": "PART_OF",
+                        "evidence_id": "e3",
+                    }
+                ],
+            }
+        }
+    )
+    assert result.knowledge_graph.edges[0].model_dump() == {
+        "source": "component",
+        "target": "system",
+        "relation": "PART_OF",
+        "evidence_id": "e3",
+    }
+
+
+def test_graph_edge_rejects_empty_evidence_id():
+    with pytest.raises(ValidationError):
+        GraphEdge(source="A", target="B", relation="RELATES_TO", evidence_id="")
+
+
+def test_extract_section_graph_drops_edges_missing_evidence_id():
     service = make_service()
     service.client = FakeClient(
         response_texts=[
-            '{"approvals":[{"index":1,"quote":"A is a component of B."}]}'
+            json.dumps(
+                {
+                    "knowledge_graph": {
+                        "nodes": [{"name": "Guanaco", "description": "chat model"}],
+                        "edges": [
+                            {
+                                "source": "adapter",
+                                "relation": "PART_OF",
+                                "target": "QLoRA",
+                                "evidence_id": "e0",
+                            },
+                            {
+                                "source": "Guanaco",
+                                "relation": "RELATES_TO",
+                                "target": "QLORA",
+                                "e28": "e28",
+                            },
+                        ],
+                    }
+                }
+            )
         ]
     )
+
+    result = service.extract_section_graph("A compact update is a component of QLoRA.", [])
+
+    assert result["knowledge_graph"]["edges"] == [
+        {
+            "source": "adapter",
+            "target": "QLoRA",
+            "relation": "PART_OF",
+            "evidence_id": "e0",
+        }
+    ]
+
+
+def test_graph_edge_approval_accepts_index_only_and_dumps_without_quote():
+    approval = GraphEdgeApproval.model_validate({"index": 0})
+    dumped = approval.model_dump()
+    assert dumped == {"index": 0}
+    assert "quote" not in dumped
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"index": 0, "quote": "A is part of B."},
+        {"index": 0, "relation": "PART_OF"},
+        {"index": 0, "source": "A"},
+        {"index": 0, "target": "B"},
+        {"index": 0, "evidence_id": "e0"},
+        {"index": "zero"},
+        {"index": "0"},
+        {"index": 0.0},
+    ],
+)
+def test_graph_edge_approval_rejects_rewrite_fields_and_non_int_index(payload):
+    with pytest.raises(ValidationError):
+        GraphEdgeApproval.model_validate(payload)
+
+
+def test_graph_evidence_edge_accepts_part_of_with_evidence_id():
+    edge = GraphEvidenceEdge.model_validate(
+        {
+            "source": "layer",
+            "relation": "PART_OF",
+            "target": "encoder",
+            "evidence_id": "e1",
+        }
+    )
+    assert edge.model_dump() == {
+        "source": "layer",
+        "relation": "PART_OF",
+        "target": "encoder",
+        "evidence_id": "e1",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "source": "layer",
+            "relation": "PART_OF",
+            "target": "encoder",
+            "quote": "layer of encoder",
+        },
+        {
+            "source": "layer",
+            "relation": "RELATES_TO",
+            "target": "encoder",
+            "evidence_id": "e0",
+        },
+        {
+            "source": "layer",
+            "relation": "PART_OF",
+            "target": "encoder",
+            "evidence_id": "e0",
+            "extra": "x",
+        },
+        {
+            "source": "layer",
+            "relation": "PART_OF",
+            "target": "encoder",
+            "evidence_id": "",
+        },
+    ],
+)
+def test_graph_evidence_edge_rejects_quote_relates_to_extra_and_empty_id(payload):
+    with pytest.raises(ValidationError):
+        GraphEvidenceEdge.model_validate(payload)
+
+
+def test_graph_verification_and_evidence_results_respect_candidate_bound():
+    within = GraphEdgeVerificationResult(
+        approvals=[{"index": i} for i in range(MAX_GRAPH_VERIFIER_CANDIDATES)]
+    )
+    assert len(within.approvals) == MAX_GRAPH_VERIFIER_CANDIDATES
+    with pytest.raises(ValidationError):
+        GraphEdgeVerificationResult(
+            approvals=[{"index": i} for i in range(MAX_GRAPH_VERIFIER_CANDIDATES + 1)]
+        )
+
+    within_edges = GraphEvidenceResult(
+        edges=[
+            {
+                "source": "part",
+                "relation": "PART_OF",
+                "target": "whole",
+                "evidence_id": f"e{i}",
+            }
+            for i in range(MAX_GRAPH_VERIFIER_CANDIDATES)
+        ]
+    )
+    assert len(within_edges.edges) == MAX_GRAPH_VERIFIER_CANDIDATES
+    with pytest.raises(ValidationError):
+        GraphEvidenceResult(
+            edges=[
+                {
+                    "source": "part",
+                    "relation": "PART_OF",
+                    "target": "whole",
+                    "evidence_id": f"e{i}",
+                }
+                for i in range(MAX_GRAPH_VERIFIER_CANDIDATES + 1)
+            ]
+        )
+
+
+def test_graph_verifier_uses_indexed_immutable_candidates_and_evidence_span_contract():
+    service = make_service()
+    service.client = FakeClient(
+        response_texts=[
+            '{"approvals":[{"index":1}]}'
+        ]
+    )
+    section = "A is a component of B."
     candidates = [
-        {"source": "B", "relation": "PART_OF", "target": "A"},
-        {"source": "A", "relation": "PART_OF", "target": "B"},
+        {
+            "source": "B",
+            "relation": "PART_OF",
+            "target": "A",
+            "evidence_id": "e0",
+        },
+        {
+            "source": "A",
+            "relation": "PART_OF",
+            "target": "B",
+            "evidence_id": "e0",
+        },
     ]
     original_candidates = [dict(candidate) for candidate in candidates]
 
-    assert service.verify_graph_edges(
-        "A is a component of B.", candidates
-    ) == [{"index": 1, "quote": "A is a component of B."}]
+    assert service.verify_graph_edges(section, candidates) == [{"index": 1}]
     assert candidates == original_candidates
 
     request = service.client.responses.calls[0]
@@ -292,22 +509,35 @@ def test_graph_verifier_uses_indexed_immutable_candidates_and_exact_quote_contra
     assert request["text"] == {"format": {"type": "json_object"}}
     assert "reasoning" not in request
     prompt = request["input"][1]["content"]
-    assert '"index": 0, "source": "B", "relation": "PART_OF", "target": "A"' in prompt
-    assert '"index": 1, "source": "A", "relation": "PART_OF", "target": "B"' in prompt
-    assert "short contiguous quote copied exactly from the source" in prompt
+    assert (
+        '"index": 0, "source": "B", "relation": "PART_OF", "target": "A", '
+        f'"evidence_id": "e0", "evidence": "{section}"'
+    ) in prompt
+    assert (
+        '"index": 1, "source": "A", "relation": "PART_OF", "target": "B", '
+        f'"evidence_id": "e0", "evidence": "{section}"'
+    ) in prompt
+    assert '{"approvals": [{"index": 0}]}' in prompt
+    assert "do not invent or copy a quote" in prompt
+    assert "short contiguous quote copied exactly from the source" not in prompt
     assert f"At most {MAX_GRAPH_VERIFIER_CANDIDATES} candidates are supplied" in prompt
-    assert "at most 500 characters" in prompt
+    assert "resolved evidence span explicitly supports" in prompt
     assert "understanding A is required\n  before understanding B" in prompt
     assert "component, part, layer, module, or element" in prompt
     assert "A explains, defines, or describes B" in prompt
     assert "does not\n  imply precedence, composition, or direction" in prompt
     assert "Usage, reliance, architectural basis, addition, application, possession, capability" in prompt
     assert "does not by\n  itself support any candidate relation, including RELATES_TO" in prompt
-    assert 'candidate technique B PART_OF System A with quote "System A\n  uses technique B." MUST be omitted' in prompt
+    assert (
+        'candidate technique B PART_OF System A with evidence "System A\n'
+        '  uses technique B." MUST be omitted'
+    ) in prompt
     assert '"Technique B is a layer of System A." MAY be approved' in prompt
-    assert "MUST be copied verbatim from the source section, never paraphrased" in prompt
+    assert "Never invent, paraphrase, or replace the resolved evidence span" in prompt
     assert "Never add an edge" in prompt
-    assert "change an\n  endpoint or relation, reverse direction" in prompt
+    assert "change an endpoint,\n  relation, direction, or evidence_id" in prompt
+    assert '"quote"' not in prompt
+    assert "<source_section>" not in prompt
 
 
 def test_graph_verifier_skips_provider_call_without_candidates():
@@ -321,7 +551,12 @@ def test_graph_verifier_skips_provider_call_without_candidates():
 def test_graph_verifier_bounds_its_candidate_payload():
     service = make_service()
     candidates = [
-        {"source": "A", "relation": "RELATES_TO", "target": "B"}
+        {
+            "source": "A",
+            "relation": "RELATES_TO",
+            "target": "B",
+            "evidence_id": "e0",
+        }
         for _ in range(MAX_GRAPH_VERIFIER_CANDIDATES + 1)
     ]
     service.client = FakeClient(response_texts=['{"approvals":[]}'])
@@ -337,8 +572,9 @@ def test_graph_verifier_bounds_its_candidate_payload():
     "response_text",
     [
         "{}",
-        '{"approvals":[{"index":"zero","quote":"A supports B."}]}',
+        '{"approvals":[{"index":"zero"}]}',
         '{"approvals":[{"index":0,"quote":"A supports B.","relation":"RELATES_TO"}]}',
+        '{"approvals":[{"index":0,"evidence_id":"e0"}]}',
     ],
 )
 def test_graph_verifier_rejects_invalid_structural_responses(response_text):
@@ -348,32 +584,50 @@ def test_graph_verifier_rejects_invalid_structural_responses(response_text):
     with pytest.raises(ValidationError):
         service.verify_graph_edges(
             "A supports B.",
-            [{"source": "A", "relation": "RELATES_TO", "target": "B"}],
+            [
+                {
+                    "source": "A",
+                    "relation": "RELATES_TO",
+                    "target": "B",
+                    "evidence_id": "e0",
+                }
+            ],
         )
 
     assert len(service.client.responses.calls) == 1
 
 
-def test_graph_recovery_accepts_grounded_part_of_edge_with_exact_quote():
+def test_graph_recovery_accepts_grounded_part_of_edge_with_evidence_id():
     service = make_service()
     service.client = FakeClient(
         response_texts=[
             '{"edges":[{"source":"feed-forward network",'
             '"relation":"PART_OF","target":"encoder layer",'
-            '"quote":"Each encoder layer contains a feed-forward network."}]}'
+            '"evidence_id":"e0"}]}'
         ]
     )
+    section = "Each encoder layer contains a feed-forward network."
 
-    assert service.extract_graph_edges_with_evidence(
-        "Each encoder layer contains a feed-forward network.", []
-    ) == [
+    assert service.extract_graph_edges_with_evidence(section, []) == [
         {
             "source": "feed-forward network",
             "relation": "PART_OF",
             "target": "encoder layer",
-            "quote": "Each encoder layer contains a feed-forward network.",
+            "evidence_id": "e0",
         }
     ]
+
+    request = service.client.responses.calls[0]
+    assert request["max_output_tokens"] == GRAPH_RECOVERY_MAX_OUTPUT_TOKENS
+    prompt = request["input"][1]["content"]
+    assert '"evidence_id": "e12"' in prompt
+    assert "Numbered source evidence spans:" in prompt
+    assert f"[e0] {section}" in prompt
+    assert "Do not invent an evidence_id" in prompt
+    assert "Both endpoints must appear in that same selected span" in prompt
+    assert "short exact source quote" not in prompt
+    assert '"quote"' not in prompt
+    assert "<source_section>" not in prompt
 
 
 def test_graph_recovery_allows_empty_edges_when_no_direct_relation_exists():
@@ -387,11 +641,13 @@ def test_graph_recovery_allows_empty_edges_when_no_direct_relation_exists():
     "response_text",
     [
         '{"edges":[{"source":"part","relation":"PART_OF",'
-        '"target":"whole","quote":"part is in whole", "extra":"x"}]}',
+        '"target":"whole","evidence_id":"e0", "extra":"x"}]}',
         '{"edges":[{"source":"part","relation":"RELATES_TO",'
-        '"target":"whole","quote":"part is related to whole"}]}',
+        '"target":"whole","evidence_id":"e0"}]}',
         '{"edges":[{"source":"part","relation":"PART_OF",'
-        '"target":"whole","quote":"' + ("x" * 501) + '"}]}',
+        '"target":"whole","evidence_id":""}]}',
+        '{"edges":[{"source":"part","relation":"PART_OF",'
+        '"target":"whole","quote":"part is in whole"}]}',
     ],
 )
 def test_graph_recovery_rejects_unsafe_or_malformed_edges(response_text):
@@ -400,6 +656,8 @@ def test_graph_recovery_rejects_unsafe_or_malformed_edges(response_text):
 
     with pytest.raises(ValidationError):
         service.extract_graph_edges_with_evidence("part is part of whole.", [])
+
+    assert len(service.client.responses.calls) == 1
 
 
 @pytest.mark.parametrize(

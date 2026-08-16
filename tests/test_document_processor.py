@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,110 @@ def install_pdf(monkeypatch, pages: list[str]) -> None:
         pages=[FakePage(page) for page in pages],
     )
     monkeypatch.setattr("database.document_processor.PdfReader", lambda _: reader)
+
+
+def write_mineru_artifacts(
+    tmp_path, markdown: str, *, complete: bool = True, state: str = "done"
+):
+    markdown_path = tmp_path / "mineru-paper.md"
+    manifest_path = tmp_path / "mineru-paper.manifest.json"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source": "paper.pdf",
+                "page_count": 4,
+                "complete": complete,
+                "markdown_path": str(markdown_path),
+                "chunks": [
+                    {
+                        "page_range": "1-4",
+                        "start_page": 1,
+                        "end_page": 4,
+                        "task_id": "task-1",
+                        "state": state,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return markdown_path, manifest_path
+
+
+def test_mineru_markdown_keeps_body_provenance_and_omits_noise(tmp_path):
+    markdown_path, manifest_path = write_mineru_artifacts(
+        tmp_path,
+        "# Paper title\nAuthors\n"
+        "## Abstract\nA summary.\n"
+        "## 1 Introduction\nThe body.\n"
+        "## We also believe this sentence continues\nMore body.\n"
+        "## References\n[1] Omit me.\n"
+        "## A Appendix\nAlso omit me.",
+    )
+
+    processor = DocumentProcessor()
+    sections = processor.process_mineru_markdown(markdown_path, manifest_path)
+
+    assert [section["metadata"]["section"] for section in sections] == [
+        "Abstract",
+        "1 Introduction",
+    ]
+    assert "We also believe this sentence continues" in sections[1]["page_content"]
+    assert "Omit me" not in " ".join(section["page_content"] for section in sections)
+    assert sections[0]["metadata"] == {
+        "source": "mineru-paper.md",
+        "section": "Abstract",
+        "mineru_source": "paper.pdf",
+        "mineru_page_ranges": ["1-4"],
+        "seq_id": 0,
+    }
+    assert processor.last_report == {
+        "retained_section_count": 2,
+        "bibliography_omitted": True,
+        "mineru_source": "paper.pdf",
+        "mineru_page_ranges": ["1-4"],
+    }
+
+
+@pytest.mark.parametrize(
+    "complete,state,error",
+    [(False, "done", "incomplete"), (True, "failed", "unfinished")],
+)
+def test_mineru_manifest_must_be_complete_before_parsing(
+    tmp_path, complete, state, error
+):
+    markdown_path, manifest_path = write_mineru_artifacts(
+        tmp_path, "## Abstract\nBody.", complete=complete, state=state
+    )
+
+    with pytest.raises(ValueError, match=error):
+        DocumentProcessor().process_mineru_markdown(markdown_path, manifest_path)
+
+
+def test_mineru_manifest_must_match_selected_markdown(tmp_path):
+    markdown_path, manifest_path = write_mineru_artifacts(
+        tmp_path, "## Abstract\nBody."
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["markdown_path"] = str(tmp_path / "other.md")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not belong"):
+        DocumentProcessor().process_mineru_markdown(markdown_path, manifest_path)
+
+
+def test_mineru_manifest_ranges_must_cover_the_pdf(tmp_path):
+    markdown_path, manifest_path = write_mineru_artifacts(
+        tmp_path, "## Abstract\nBody."
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["chunks"][0]["end_page"] = 3
+    manifest["chunks"][0]["page_range"] = "1-3"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cover the PDF"):
+        DocumentProcessor().process_mineru_markdown(markdown_path, manifest_path)
 
 
 def test_pdf_omits_front_matter_and_everything_from_references(monkeypatch, tmp_path):

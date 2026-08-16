@@ -9,7 +9,7 @@ from typing import Any
 import streamlit as st
 
 from config.settings import Settings
-from core.data_ingestion import ingest_document
+from core.data_ingestion import compile_uploaded_document
 from database.semantic_dag import Neo4jManager
 from database.structural_db import QdrantVectorStore
 from orchestrator.llm_service import LLMService
@@ -18,6 +18,8 @@ from runtime.engine import RuntimeEngine
 PAPERS_DIR = Path("data/papers")
 INGESTION_SUMMARY_KEY = "ingestion_summary"
 INGESTION_STATUS_LABELS = {
+    "extracting": "Extracting with MinerU",
+    "extracted": "MinerU extraction complete",
     "compiling": "Compiling",
     "compiled": "Compiled",
     "up_to_date": "Already up to date",
@@ -110,6 +112,10 @@ def main() -> None:
                 f"elapsed: {summary['elapsed_seconds']:.1f}s."
             )
         uploaded = st.file_uploader("Upload PDF or Markdown", type=["pdf", "md", "markdown"])
+        st.caption(
+            "PDFs are extracted with MinerU Flash, then compiled with the AOT graph pipeline. "
+            "The PDF is uploaded to MinerU; do not use this for sensitive papers."
+        )
         force_reingest = st.checkbox("Force re-ingest", value=False)
         if uploaded and st.button("Ingest paper", use_container_width=True):
             PAPERS_DIR.mkdir(parents=True, exist_ok=True)
@@ -130,7 +136,7 @@ def main() -> None:
 
             try:
                 started_at = perf_counter()
-                result = ingest_document(
+                result = compile_uploaded_document(
                     destination,
                     db,
                     engine.llm,
@@ -211,9 +217,15 @@ def main() -> None:
                 for section in sections
                 if section["metadata"].get("source") == graph_paper
             ]
-            graph_section = st.selectbox("Section", graph_sections, key="graph-section")
-            locator = f"{graph_paper}::{graph_section}"
-            graph = dag.get_visual_graph(locator)
+            graph_section = st.selectbox(
+                "Section",
+                ["All sections", *graph_sections],
+                key="graph-section",
+            )
+            if graph_section == "All sections":
+                graph = dag.get_visual_graph(source=graph_paper)
+            else:
+                graph = dag.get_visual_graph(f"{graph_paper}::{graph_section}")
             st.caption(f"{len(graph['nodes'])} concepts, {len(graph['edges'])} relationships")
             st.subheader("Concepts")
             st.dataframe(graph["nodes"], use_container_width=True, hide_index=True)
