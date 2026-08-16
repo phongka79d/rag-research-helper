@@ -1,320 +1,222 @@
 # RAG Research Helper
 
-## Overview
+A local Streamlit mentor for research papers. You upload a paper, the app compiles it once, then you can **Ask**, **Teach**, or inspect the **Graph**.
 
-RAG Research Helper is a local Streamlit app for exploring research papers as a compact research mentor. It performs expensive analysis during ingestion, then uses the precompiled results at runtime for three direct workflows:
+It is a small, readable pipeline — not an enterprise product and not a LangChain wrapper. Expensive work happens at ingest (AOT). Ask and Teach only retrieve and generate.
 
-- **Ask:** retrieve relevant paper sections, add nearby concept relationships, and generate a grounded answer with sources.
-- **Teach:** turn a stored section roadmap into step-by-step lessons with prerequisite context.
-- **Graph:** inspect concepts and relations extracted from a selected paper section.
+## What you get
 
-The implementation intentionally stays small: the OpenAI Python SDK sends requests to one configured OpenAI-compatible provider, Qdrant provides semantic retrieval, Neo4j stores concept relationships, and Python wires the flow together. It does not use LangChain, LangGraph, or production-style service/repository layers.
+| Tab | What it does |
+| --- | --- |
+| **Ask** | Retrieve at most two parent sections, attach nearby concept relations, and answer with source labels. Tables and display math in the answer are rendered (GFM + KaTeX). |
+| **Teach** | Walk a stored section roadmap step by step, with one-hop prerequisite context from the graph. |
+| **Graph** | Show concepts and relations extracted from a selected section as a table and a Mermaid diagram. |
 
-## What This Folder Does
-
-This repository is the complete local application. The implementation plan in `RAG_Research_Helper_Simple_Reference_First_Rebuild_Plan.md` is the product and architecture source of truth. Runtime behavior is defined primarily by:
-
-- `main.py` for the Streamlit UI and direct object wiring.
-- `core/data_ingestion.py` for ahead-of-time (AOT) paper compilation.
-- `database/structural_db.py` for Qdrant storage and retrieval.
-- `database/semantic_dag.py` for the Neo4j concept graph.
-- `orchestrator/llm_service.py` for direct OpenAI-compatible Responses and Embeddings API calls.
-- `runtime/engine.py` for the direct Ask and Teach flows.
-
-Do not casually reset or delete local Neo4j volumes: they can contain existing graph data. `setup_env.py` is the safe credential and connectivity utility.
-
-## Repository Structure
+## Pipeline
 
 ```text
-.
-├── config/                 # Environment-backed Settings
-├── core/                   # Small schemas and AOT ingestion loop
-├── database/               # PDF/Markdown parsing, Qdrant, and Neo4j
-├── orchestrator/           # Direct OpenAI SDK client
-├── runtime/                # Ask and Teach orchestration
-├── data/
-│   ├── papers/             # Locally uploaded or sample papers
-│   ├── eval.json           # Legacy/demo retrieval evaluation cases
-│   └── eval_real_papers.json # Source-scoped benchmark for the three supplied PDFs
-├── tests/                  # Behavior-focused pytest coverage
-├── main.py                 # Streamlit entry point
-├── evaluate.py             # Baseline / HyDE-rerank / graph-context evaluation
-├── setup_env.py            # Safe local Neo4j setup and verification
-├── docker-compose.yml      # Local Qdrant and Neo4j services
-├── requirements.txt
-└── RAG_Research_Helper_Simple_Reference_First_Rebuild_Plan.md
+PDF  →  MinerU Flash (required)  →  section split
+Markdown (already extracted)     →  section split
+                                      │
+                                      ▼
+                         AOT compile (per section)
+                         • learning roadmap
+                         • HyDE questions (0–5)
+                         • grounded concept graph
+                                      │
+                    ┌─────────────────┴─────────────────┐
+                    ▼                                   ▼
+              Qdrant                              Neo4j
+              research_curriculum                 Concept nodes
+              (section + roadmap)                 + research relations
+              research_questions
+              (child → parent_id)
+                    │
+                    ▼
+         Ask / Teach / Graph  (no re-extract)
 ```
 
-## Main Workflows
+A PDF never starts AOT until MinerU returns a **complete** extract (`data/mineru/<name>.md` + manifest). Incomplete extraction is fail-closed. Markdown skips MinerU and uses the same compile path.
 
-### 1. Environment and databases
+Bibliography / References headings are skipped; appendix-style sections after that are kept.
 
-1. `Settings` loads `.env` through `config/settings.py`.
-2. `setup_env.py` fills missing non-secret defaults, safely recovers an existing Neo4j credential only when it can verify it, and stops rather than resetting existing graph data.
-3. `docker-compose.yml` starts Qdrant and Neo4j with the password supplied through `.env`.
-4. `main.py` validates settings and calls `Neo4jManager.verify_connection()` before rendering the app.
+## How retrieval works
 
-### 2. Ingest a PDF or Markdown paper
+Ask does **not** search the raw paper text first. It searches the hypothetical questions stored at ingest, then resolves the original section.
 
-1. The sidebar in `main.py` saves the uploaded file under `data/papers/`.
-2. A PDF is extracted with MinerU Flash first (`data/mineru/<name>.md` plus a complete manifest). Incomplete extraction never starts AOT. Markdown is treated as already-extracted text.
-3. `DocumentProcessor.process_mineru_markdown()` (or the Markdown parser) splits the extracted text into ordered sections with source, section, and sequence metadata.
-4. `ingest_document()` in `core/data_ingestion.py` runs the existing AOT path: a learning roadmap, grounded graph candidates (local span scan first, model graph only when needed), HyDE questions, and Neo4j/Qdrant persistence. The local matcher can retain direct whole-part edges; the verifier still reviews model-proposed candidates.
-4. The graph is stored in Neo4j; roadmap steps and full parent sections are stored in `research_curriculum`; up to five directly answerable hypothetical question children are stored in `research_questions` (thin sections may have none).
-5. Each child question keeps its `parent_id`, so retrieval can resolve the complete original section.
-6. The completion result reports graph candidates, verifier approvals, and retained relationships. A zero in any counter is valid and makes an empty Graph tab diagnosable.
+1. Embed the user query.
+2. Search up to **25** HyDE question hits in Qdrant (`research_questions`).
+3. Collapse to at most **5** unique parent sections.
+4. Optional **Jina** rerank of that pool. If Jina is unset or uncertain, fall back to an **LLM** reranker, then to vector order.
+5. Fuse at most **2** parent sections.
+6. Pull 1–2 hop concept context from Neo4j and generate a grounded answer.
 
-### 3. Ask a paper question
+Provenance is recorded as `jina`, `llm_fallback`, `llm`, or `vector`. The two-parent cap is intentional: more parents is not treated as better evidence.
 
-1. `RuntimeEngine.ask()` calls `QdrantVectorStore.search_candidates_and_fetch_parent()`.
-2. The query embedding searches up to 25 hypothetical-question hits, optionally filtered to one paper, and keeps the first hit for at most five unique parent sections.
-3. If `JINA_API_KEY` is configured, the optional Jina reranker receives the user query and candidate hypothetical questions. The cascade is Jina → OpenAI-compatible LLM reranker when Jina is unavailable/uncertain → vector order when no reranker selection is usable. The final evidence set remains at most two parents, and stores truthful provenance (`jina`, `llm_fallback`, `llm`, or `vector`).
-4. The engine reads 1–2 hop concept context from Neo4j and sends the parent text plus graph context to `LLMService.answer()`.
-5. The UI displays the answer, stored source labels, and optional graph context.
+## How the graph is grounded
 
-### 4. Teach a section
+Each compiled section is scanned for research relations and also sent to a graph model. A kept edge must:
 
-1. The user selects a paper and section in the Teach tab.
-2. `RuntimeEngine.teach_section()` fetches the full stored section and its AOT roadmap.
-3. For each roadmap step, it fetches one-hop prerequisite context and asks `LLMService.teach_step()` for a grounded lesson.
-4. Streamlit renders each lesson in roadmap order.
+- name two concept endpoints (not pronouns, clause fragments, or function words);
+- cite a numbered evidence span (`eN`) that actually appears in the section;
+- use a relation the quote can support.
 
-### 5. Inspect the graph and evaluate retrieval
+**18 canonical relations:** `PART_OF`, `PREREQUISITE_OF`, `DESCRIBES`, `RELATES_TO`, `USES`, `EVALUATED_ON`, `TRAINED_ON`, `BASED_ON`, `PROPOSES`, `OUTPERFORMS`, `COMPARES_TO`, `ACHIEVES`, `REQUIRES`, `APPLIED_TO`, `IMPROVES`, `ENABLES`, `PRODUCES`, `HAS_FEATURE`.
 
-- The Graph tab queries `Neo4jManager.get_visual_graph(locator)` and renders concepts and relationships as tables.
-- `evaluate.py` compares the direct parent-section vector baseline with the same hypothetical-question retrieval and two-parent fusion used by Ask. It reports baseline Recall@5, runtime Recall@2 and MRR, all-expected-sources coverage, retrieval latency, graph-context size, fixed four-way rerank provenance rates, and effective bounded retrieval capacities in `eval_results.json`.
-- Recall and MRR measure parent-section retrieval only; they are not graph-edge precision. Use `python evaluate.py --graph-sample` (optional repeated `--source`) to list unique stored Concept edges from Neo4j without an LLM judge.
+A wording table maps paper phrasing onto that set. If nothing matches, a well-formed novel `UPPER_SNAKE` predicate may be kept. Unknown garbage is dropped — it is **not** silently remapped to `RELATES_TO`.
 
-## Architecture
+Thin sections (under 200 characters of body) still get a roadmap when possible; they do not get a graph or HyDE questions.
 
-```text
-PDF
-  → MinerU Flash extract (required)
-  → DocumentProcessor (MinerU Markdown)
-  → AOT extraction (OpenAI) + local graph scan
-  → Neo4j Concept graph + Qdrant parent / roadmap / question points
+Empty graph context at Ask/Teach time is left empty. The model is told not to invent relations.
 
-Markdown (already extracted)
-  → DocumentProcessor
-  → same AOT path
+## Stack
 
-Question
-  → OpenAI embedding
-  → Qdrant question search
-  → optional Jina rerank → OpenAI-compatible LLM fallback → vector order
-  → parent section(s) + Neo4j context
-  → grounded OpenAI answer + source labels
-```
+| Piece | Role |
+| --- | --- |
+| Streamlit (`main.py`) | UI and direct object wiring |
+| OpenAI-compatible Responses + Embeddings | AOT, HyDE, rerank, answers, lessons |
+| Qdrant | Parent sections, roadmap steps, HyDE children |
+| Neo4j | Shared `Concept` nodes and relations |
+| MinerU Flash | Required PDF layout/OCR → Markdown |
+| Optional Jina | Rerank the bounded question pool |
 
-The key storage model is deliberately narrow:
-
-- Qdrant collection `research_curriculum`: `section_anchor` and `roadmap_step` points.
-- Qdrant collection `research_questions`: hypothetical question points with a `parent_id`.
-- Neo4j: `Concept` nodes and mapped research relations (`PART_OF`, `USES`, `EVALUATED_ON`, and the rest of the wording table), plus a well-formed novel relation when no table row matches.
-
-## Frontend
-
-`main.py` is a single Streamlit entry point with:
-
-- a sidebar for upload/ingestion and current-paper filtering;
-- **Ask**, **Teach**, and **Graph** tabs;
-- no separate API server, controller layer, or client-side state system.
-
-## Data, Storage, and External Services
-
-| Component | Purpose | Defined by |
-| --- | --- | --- |
-| OpenAI-compatible Responses API | AOT extraction, hypothetical questions, reranking, answers, and lessons | `orchestrator/llm_service.py` |
-| OpenAI-compatible Embeddings API | Query, section, roadmap, and question vectors | `orchestrator/llm_service.py` |
-| Optional Jina rerank API | Reranks the bounded query/question candidate pool when `JINA_API_KEY` is set | `orchestrator/llm_service.py` |
-| Qdrant | Parent sections, roadmap steps, and hypothetical question retrieval | `database/structural_db.py` |
-| Neo4j | Shared research concepts and bounded graph context | `database/semantic_dag.py` |
-| `data/papers/` | Uploaded/local paper files | `main.py` |
-| `data/eval.json` | Legacy/demo retrieval evaluation cases (CLI default) | `evaluate.py` |
-| `data/eval_real_papers.json` | Three-real-paper retrieval benchmark | `evaluate.py` |
-
-## Configuration
-
-Copy `.env.example` to `.env`; never commit `.env` or its values.
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `OPENAI_BASE_URL` | No | OpenAI-compatible `/v1` base URL; defaults to `https://api.shopaikey.com/v1`. |
-| `OPENAI_API_KEY` | Yes for app and evaluation | Credential passed to the configured provider through the OpenAI SDK. |
-| `OPENAI_MODEL` | No | Text model; defaults to `gpt-4o-mini`. |
-| `OPENAI_GRAPH_MODEL` | No | Graph extraction/verifier/recovery model; blank falls back to `OPENAI_MODEL` (for example, `gpt-4.1-nano`). It uses the same compatible endpoint and key. |
-| `OPENAI_EMBEDDING_MODEL` | No | Embedding model; defaults to `text-embedding-3-small`. |
-| `OPENAI_EMBEDDING_DIM` | No | Qdrant vector size; defaults to `1536`. It must match the configured embedding model. |
-| `QDRANT_URL` | No | Qdrant endpoint; defaults to `http://localhost:6333`. |
-| `QDRANT_SEARCH_LIMIT` | No | Maximum question hits searched per query; defaults to 25 and is capped at 25. |
-| `QDRANT_MAX_CANDIDATE_PARENTS` | No | Maximum unique parents sent to reranking; defaults to 5 and is capped at 5. |
-| `NEO4J_URI` | No | Neo4j Bolt endpoint; defaults to `bolt://localhost:7687`. |
-| `NEO4J_USER` | No | Neo4j user; defaults to `neo4j`. |
-| `NEO4J_PASSWORD` | Yes | Local Neo4j password, created/recovered and verified by `setup_env.py`. |
-| `JINA_API_KEY` | No | Optional Jina credential. When set, query text and candidate questions are sent to the configured Jina endpoint for reranking. |
-| `JINA_RERANK_URL` | No | Jina-compatible rerank endpoint; defaults to `https://api.jina.ai/v1/rerank`. |
-| `JINA_RERANK_MODEL` | No | Jina rerank model; defaults to `jina-reranker-v2-base-multilingual`. |
-| `JINA_RPM` | No | Local Jina request-rate limit; invalid values use 100 requests/minute. |
-| `JINA_RERANK_MARGIN` | No | Minimum top-score margin before LLM fallback; defaults to 0.08. |
+There is no API server, no repository/service layer, and no LangChain / LangGraph. `RuntimeEngine` calls Qdrant, Neo4j, and `LLMService` directly.
 
 ## Setup
 
-1. Create and activate a virtual environment.
+Windows (PowerShell):
 
-   ```powershell
-   python -m venv .venv
-   .venv\Scripts\Activate.ps1
-   python -m pip install -r requirements.txt
-   ```
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
 
-2. Copy `.env.example` to `.env`, then set `OPENAI_API_KEY`.
+Copy `.env.example` to `.env` and set `OPENAI_API_KEY`. The provider must implement both `/v1/responses` and `/v1/embeddings`. Changing `.env` requires a full Streamlit restart; a process-level environment variable wins over `.env`.
 
-   The configured provider must support both the OpenAI Responses (`/v1/responses`) and Embeddings (`/v1/embeddings`) contracts used by this app. Changing `.env` values requires stopping and fully restarting Streamlit; refreshing the browser is not enough. A process-level environment variable takes precedence over `.env`, so inspect the running process when a changed model appears to be ignored.
+Optional live checks (they do not write to Qdrant or Neo4j):
 
-   Before ingesting a paper, run the opt-in compatibility checks. The Responses check makes one request for the text model and one for a distinct graph model (one request total when the graph setting falls back); neither check writes to Qdrant or Neo4j:
+```powershell
+python scripts/live_test_responses.py
+python scripts/live_test_embeddings.py
+```
 
-   ```powershell
-   python scripts/live_test_responses.py
-   python scripts/live_test_embeddings.py
-   ```
+Start local databases without wiping existing Neo4j data:
 
-3. Run the safe local database setup. It does not print the Neo4j password and refuses to reset existing Neo4j data when the credential cannot be verified.
+```powershell
+python setup_env.py --start
+```
 
-   ```powershell
-   python setup_env.py --start
-   ```
+`setup_env.py` fills non-secret defaults, recovers a Neo4j password only when it can verify it, and **refuses** to reset graph volumes. Do not delete Neo4j volumes casually.
 
-4. Run the app.
-
-   ```powershell
-   streamlit run main.py
-   ```
-
-The compose file can also be started directly after `.env` contains a verified `NEO4J_PASSWORD`:
+Or, after `.env` has a verified `NEO4J_PASSWORD`:
 
 ```powershell
 docker compose up -d qdrant neo4j
 ```
 
-## Running the Project
+Run the app:
 
 ```powershell
 streamlit run main.py
 ```
 
-Upload a PDF, `.md`, or `.markdown` file in the sidebar. PDFs are extracted with MinerU Flash first, then compiled through the same AOT graph pipeline. Markdown skips MinerU. Compilation uses the configured OpenAI-compatible endpoint and writes into the local Qdrant and Neo4j services.
+## Use
 
-When `OPENAI_GRAPH_MODEL` is set, roadmap and hypothetical-question generation stay on
-`OPENAI_MODEL`; graph extraction, verification, and recovery use the graph model. The
-plan, graph, and question requests for one section run in a small bounded group. Both
-models still use the same `OPENAI_BASE_URL` and `OPENAI_API_KEY`. Restart the Streamlit
-process after changing `.env`; a process environment variable takes precedence over
-`.env`.
+1. Upload a PDF, `.md`, or `.markdown` file in the sidebar. PDFs go through MinerU Flash, then AOT. Demo Markdown papers live in `data/papers/`.
+2. Wait for the compile summary (sections compiled, graph candidates / approvals / retained). A zero in any graph counter is valid and means the Graph tab will be empty for that paper.
+3. Use **Ask** (optionally scoped to one paper), **Teach** (pick a section), or **Graph**.
 
-For an OCR/layout experiment, run the opt-in MinerU Agent Flash helper:
+When `OPENAI_GRAPH_MODEL` is set, roadmap and HyDE stay on `OPENAI_MODEL`; graph extract / verify / recover use the graph model. Both share `OPENAI_BASE_URL` and `OPENAI_API_KEY`.
+
+### MinerU Flash (PDF)
+
+The app uploads the local PDF to MinerU’s no-token signed-upload endpoint, submits page ranges (default 10, max 20), and writes Markdown plus a JSON manifest. Flash is IP-rate-limited, accepts files up to about 10 MB, and returns Markdown only. Do not send sensitive papers without reviewing that implication.
+
+A failed batch sets `complete=false` and never starts AOT. You can also run extraction alone (no Qdrant/Neo4j writes):
 
 ```powershell
 python scripts/mineru_flash.py data/papers/your-paper.pdf --output data/mineru --batch-size 10
 ```
 
-It uses the no-token signed-upload endpoint, submits contiguous page ranges (default
-10, maximum 20), polls each task, and writes Markdown plus a JSON manifest. Flash is
-IP-rate-limited, accepts files up to 10 MB and 20 pages per request, and returns
-Markdown only. The local PDF is uploaded to MinerU; do not use it for sensitive papers
-without reviewing that privacy implication. A failed batch produces `complete=false`
-and is never silently treated as a complete document. The app PDF ingest path uses this
-same client, then compiles automatically. Running the helper by hand still does not
-write Qdrant/Neo4j.
+`pypdf` remains only for callers that still invoke `ingest_document` on a PDF without a complete manifest. The Streamlit path does not use that fallback.
 
-For a controlled end-to-end comparison on the three supplied papers, run the opt-in
-validation command after Qdrant, Neo4j, and the configured provider are available:
-
-```powershell
-python scripts/validate_mineru_three_papers.py `
-  --input-dir data/papers `
-  --output-dir data/mineru-validation `
-  --batch-size 10 `
-  --workers 1
-```
-
-It processes `attention.pdf`, `qlora_paper.pdf`, and `slm_paper.pdf`, requires every
-MinerU manifest to be complete, stores derived sources such as `mineru_attention.md`
-(default `--source-prefix mineru_`), and writes a comparison report under the selected
-output directory. The original PDF sources are not replaced. The report includes
-parser cleanup, sections compiled this run versus sections skipped as already current,
-source-scoped graph counts and rejection diagnostics, a bounded retained-edge audit
-sample, Qdrant counts, retrieval metrics, and representative Ask source previews. A
-partial extraction or unavailable live dependency makes the overall report incomplete;
-it is not silently treated as a successful comparison.
-
-Optional `--source-prefix` selects the derived-source name prefix (default `mineru_`).
-It must use only letters, digits, and underscore; start with a letter; and end with
-`_`. A distinct prefix creates distinct derived source identities and does not replace
-original PDFs or prior MinerU-derived sources. Example with an isolated evidence run:
-
-```powershell
-python scripts/validate_mineru_three_papers.py `
-  --input-dir data/papers `
-  --output-dir data/mineru-validation-evidence-v2 `
-  --source-prefix mineru_evidence_ `
-  --batch-size 10 `
-  --workers 1
-```
-
-The command does not delete or clean up databases or old sources.
-
-## Testing and Validation
-
-Run the behavior-focused suite:
+## Evaluate
 
 ```powershell
 python -m pytest -q
 ```
 
-Run retrieval evaluation. The CLI default dataset is `data/eval.json`
-(legacy/demo). The three-real-paper retrieval benchmark is
-`data/eval_real_papers.json`.
+Retrieval evaluation (needs running Qdrant + Neo4j, a provider key, and ingested sections):
 
 ```powershell
-# Legacy/demo cases (default dataset path)
+# Tracked demo cases
 python evaluate.py --workers 4 --output eval_results.json
 
-# Three-real-paper retrieval benchmark (after those PDFs are ingested)
+# Local three-paper benchmark (add data/eval_real_papers.json yourself)
 python evaluate.py --dataset data/eval_real_papers.json --workers 1 --output eval_results_real_papers.json
 ```
 
-Reported Recall@5 / Recall@2 / MRR are parent-section retrieval metrics. They
-are not graph-edge precision. To inspect unique stored Concept edges for named
-papers (no LLM judge), use:
+Reported **Recall@5 / Recall@2 / MRR** are **parent-section retrieval** scores. They are **not** graph-edge precision, and they are not an LLM-as-judge quality score.
+
+To list unique stored `Concept` edges (no judge):
 
 ```powershell
 python evaluate.py --graph-sample --source attention.pdf --source qlora_paper.pdf
 ```
 
-Omit `--source` to sample the full Neo4j concept graph. The evaluation path
-requires reachable Qdrant and Neo4j, a configured OpenAI-compatible provider
-key, and the sections referenced by the selected dataset to be ingested.
-`--graph-sample` needs only Neo4j. Cases are not automatically retried; compare
-effective limits and provenance rates when interpreting quality and latency.
+Omit `--source` to sample the full Neo4j concept graph. `--graph-sample` needs only Neo4j.
 
-## Development Notes for AI Agents
+## Configuration
 
-- Read `RAG_Research_Helper_Simple_Reference_First_Rebuild_Plan.md` before changing behavior; it intentionally forbids extra architecture.
-- Before changing a major module, inspect the matching `rag-expert-mentor` reference file listed in the plan. Adapt the small relevant pattern; do not copy unrelated features wholesale.
-- Preserve the direct flow: `RuntimeEngine` calls Qdrant, Neo4j, and `LLMService` directly. Do not introduce repositories, services, adapters, factories, dependency injection, LangChain, or LangGraph.
-- Keep JSON-producing compatible-provider calls in `LLMService` in JSON mode. The rerank call has a bounded token allowance so it can return its required JSON selection.
-- Keep `.env` private. Before any Neo4j-dependent change, verify the existing database safely; never delete/reset data or volumes automatically.
-- When changing ingestion, coordinate `core/data_ingestion.py`, `database/structural_db.py`, `database/semantic_dag.py`, and their focused tests. Preserve the parent-child `parent_id` contract and up to five stored hypothetical questions per section.
-- When changing retrieval behavior, validate `tests/test_qdrant.py`, `tests/test_runtime.py`, and `evaluate.py`; test a real Ask path when configured services are available.
-- Ignore generated caches such as `__pycache__/` and `.pytest_cache/`. Treat `eval_results.json` as a generated evaluation artifact.
+Never commit `.env`.
 
-## Known Gaps or Deliberate Limits
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `OPENAI_BASE_URL` | No | OpenAI-compatible `/v1` URL. Default: `https://api.shopaikey.com/v1`. |
+| `OPENAI_API_KEY` | Yes for app and eval | Provider credential. |
+| `OPENAI_MODEL` | No | Text model. Default: `gpt-4o-mini`. |
+| `OPENAI_GRAPH_MODEL` | No | Graph extract / verify / recover. Blank → `OPENAI_MODEL`. |
+| `OPENAI_EMBEDDING_MODEL` | No | Default: `text-embedding-3-small`. |
+| `OPENAI_EMBEDDING_DIM` | No | Qdrant vector size. Default: `1536`. Must match the embedding model. |
+| `QDRANT_URL` | No | Default: `http://localhost:6333`. |
+| `QDRANT_SEARCH_LIMIT` | No | HyDE hits per query. Default 25, capped at 25. |
+| `QDRANT_MAX_CANDIDATE_PARENTS` | No | Unique parents sent to rerank. Default 5, capped at 5. |
+| `NEO4J_URI` | No | Default: `bolt://localhost:7687`. |
+| `NEO4J_USER` | No | Default: `neo4j`. |
+| `NEO4J_PASSWORD` | Yes | Created/recovered and verified by `setup_env.py`. |
+| `JINA_API_KEY` | No | Optional rerank credential. |
+| `JINA_RERANK_URL` | No | Default: `https://api.jina.ai/v1/rerank`. |
+| `JINA_RERANK_MODEL` | No | Default: `jina-reranker-v2-base-multilingual`. |
+| `JINA_RPM` | No | Local request cap. Invalid values → 100/min. |
+| `JINA_RERANK_MARGIN` | No | Margin before LLM fallback. Default: `0.08`. |
 
-- App PDF ingest uses MinerU Flash (layout/OCR Markdown) before AOT. The local PDF is uploaded to MinerU; Flash is IP-rate-limited and accepts files up to 10 MB. Direct `pypdf` remains available only for non-app callers that still call `ingest_document` on a PDF without a manifest.
-- The graph view is a table/list rather than an interactive network visualization, matching the plan’s stated first-version fallback.
-- The app depends on local Qdrant and Neo4j plus a reachable OpenAI-compatible endpoint; it has no offline fallback.
-- AOT extraction quality and answer quality remain model-dependent. The application validates JSON structure and falls back through the optional Jina → LLM → vector rerank cascade when needed.
+## Repository layout
 
-## Reference Attribution
+```text
+config/                 Settings from .env
+core/                   AOT ingest, relation vocabulary, schemas
+database/               MinerU Markdown split, Qdrant, Neo4j
+orchestrator/           Direct OpenAI-compatible SDK client
+runtime/                Ask / Teach / Markdown + Mermaid helpers
+scripts/                Live API checks, MinerU helper, 3-paper validation
+tests/                  Behavior-focused pytest
+main.py                 Streamlit entry
+evaluate.py             Retrieval + graph-sample CLI
+setup_env.py            Safe Neo4j / compose bootstrap
+docker-compose.yml      Local Qdrant + Neo4j
+```
 
-This project uses [rag-expert-mentor](https://github.com/phongka79d/rag-expert-mentor) as a file-by-file architecture and implementation reference. Relevant patterns were adapted for research-paper AOT ingestion, Qdrant parent-child retrieval, Neo4j concept traversal, and direct runtime orchestration. The project does not copy unrelated product features wholesale. Consult the reference repository’s license and author permissions before reusing substantial source verbatim.
+`data/papers/` holds uploads (gitignored except two demo Markdown files). MinerU extracts land under `data/mineru/`.
+
+## Deliberate limits
+
+- PDF ingest uploads the file to MinerU Flash. There is no offline PDF path in the app.
+- The Graph tab is a table plus Mermaid, not an interactive network editor.
+- AOT quality and answers follow the configured model. Structure is validated; content is not claimed as SOTA.
+- Retrieval scores measure whether the right **section** came back, not whether every graph edge is correct.
+- Ask stays at two fused parents. Raising that cap is not the quality lever this project uses.
+
+## Reference
+
+Patterns for AOT ingest, Qdrant parent/child retrieval, Neo4j concept walk, and a direct runtime were adapted from [rag-expert-mentor](https://github.com/phongka79d/rag-expert-mentor). Unrelated product features were not copied. Check that repository’s license before reusing source verbatim.
