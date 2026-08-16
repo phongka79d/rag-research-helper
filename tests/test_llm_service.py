@@ -183,7 +183,7 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
             "```json\n"
             '{"main_entities":["LoRA"],"learning_roadmap":[{"title":"Method","content_focus":"low-rank update","concepts":["LoRA"]}]}\n'
             "```",
-            '{"knowledge_graph":{"nodes":[{"name":"LoRA","description":"adaptation"}],"edges":[{"source":"Matrix","target":"LoRA","relation":"unknown","evidence_id":"e0"}]}}',
+            '{"knowledge_graph":{"nodes":[{"name":"LoRA","description":"adaptation"}],"edges":[{"source":"Matrix","target":"LoRA","relation":"FINE_TUNES","evidence_id":"e0"}]}}',
             '{"qa_pairs":[{"question":"What is LoRA?","key_knowledge":"A low-rank adaptation method."},{"question":"What stays frozen?","key_knowledge":"The base weights."}]}',
         ]
     )
@@ -191,7 +191,7 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     aot = service.extract_section_plan_and_graph("LoRA freezes base weights.", ["LoRA"])
     questions = service.generate_hypothetical_questions("LoRA freezes base weights.", 2)
 
-    assert aot["knowledge_graph"]["edges"][0]["relation"] == "RELATES_TO"
+    assert aot["knowledge_graph"]["edges"][0]["relation"] == "FINE_TUNES"
     assert aot["learning_roadmap"][0]["title"] == "Method"
     assert questions == [
         {"question": "What is LoRA?", "key_knowledge": "A low-rank adaptation method."},
@@ -214,23 +214,24 @@ def test_aot_and_hyde_outputs_are_validated_through_responses_api():
     assert "Numbered source evidence spans:" not in plan_prompt
     graph_prompt = service.client.responses.calls[1]["input"][1]["content"]
     aot_prompt = graph_prompt
-    assert "understanding A is required\n  before understanding B" in aot_prompt
-    assert "component, part, layer, module, or\n  element of B" in aot_prompt
+    assert "understanding A is required before understanding B" in aot_prompt
+    assert "component, part, layer, module, or element of B" in aot_prompt
     assert "edge direction is always part to whole" in aot_prompt
-    assert "do not make an endpoint a sentence, clause, formula, number, or pronoun" in aot_prompt
-    assert "A explains, defines, or\n  describes B" in aot_prompt
+    assert "do not make an endpoint a\n  sentence, clause, formula, number, or pronoun" in aot_prompt
+    assert "A explains, defines, or describes B" in aot_prompt
     assert "does not imply direction, precedence, or composition" in aot_prompt
-    assert "Usage, reliance, architectural basis, addition, application, possession, capability" in aot_prompt
-    assert "evaluated with or on B does not by itself make A and B PART_OF, PREREQUISITE_OF" in aot_prompt
-    assert "or RELATES_TO" in aot_prompt
-    assert '"System A uses technique B" does not support technique B\n  PART_OF System A' in aot_prompt
-    assert '"Technique B is a layer\n  of System A" supports that edge' in aot_prompt
+    assert "USES: A uses, employs, utilizes, or relies on B" in aot_prompt
+    assert "EVALUATED_ON: A is evaluated or tested on B" in aot_prompt
+    assert "MAY emit one new UPPER_SNAKE_CASE relation" in aot_prompt
+    assert "Usage, reliance, evaluation, application, or possession never" in aot_prompt
+    assert "establish PART_OF, PREREQUISITE_OF, DESCRIBES, or RELATES_TO" in aot_prompt
+    assert '"System A uses technique B" does not support technique B PART_OF System A' in aot_prompt
+    assert '"Technique B is a layer of System A" supports that PART_OF edge' in aot_prompt
     assert "co-occurrence" in aot_prompt
     assert "Do not emit self-loops" in aot_prompt
     assert "mention order, section order, temporal order" in aot_prompt
-    assert "shared context, usage, or\n  evaluation" in aot_prompt
     assert "models, datasets, or benchmarks" not in aot_prompt
-    assert "relabel an unsupported relation as RELATES_TO" in aot_prompt
+    assert "relabel an unmatched or unsupported relation as RELATES_TO" in aot_prompt
     assert "differs from an existing name only by letter case" in aot_prompt
     assert "Do not merge names by removing whitespace or punctuation" in aot_prompt
     assert '"evidence_id": "e12"' in aot_prompt
@@ -527,12 +528,14 @@ def test_graph_verifier_uses_indexed_immutable_candidates_and_evidence_span_cont
     assert "A explains, defines, or describes B" in prompt
     assert "does not\n  imply precedence, composition, or direction" in prompt
     assert "Usage, reliance, architectural basis, addition, application, possession, capability" in prompt
-    assert "does not by\n  itself support any candidate relation, including RELATES_TO" in prompt
+    assert "do not by themselves support\n  PART_OF, PREREQUISITE_OF, DESCRIBES, or RELATES_TO" in prompt
     assert (
         'candidate technique B PART_OF System A with evidence "System A\n'
         '  uses technique B." MUST be omitted'
     ) in prompt
     assert '"Technique B is a layer of System A." MAY be approved' in prompt
+    assert "Candidate System A USES technique B" in prompt
+    assert "novel UPPER_SNAKE_CASE relation" in prompt
     assert "Never invent, paraphrase, or replace the resolved evidence span" in prompt
     assert "Never add an edge" in prompt
     assert "change an endpoint,\n  relation, direction, or evidence_id" in prompt
@@ -970,6 +973,11 @@ def test_answer_delimits_untrusted_evidence_and_removes_unknown_citations():
     request = service.client.responses.calls[0]
     assert request["max_output_tokens"] == ANSWER_MAX_OUTPUT_TOKENS
     assert "untrusted data" in request["input"][0]["content"].lower()
+    assert "if the stored graph context is empty, do not invent concept relations" in (
+        request["input"][0]["content"].lower()
+    )
+    assert "github-flavored markdown table" in request["input"][0]["content"].lower()
+    assert "$inline$" in request["input"][0]["content"]
     assert "<evidence citation=" in request["input"][1]["content"]
     assert "<graph_context>" in request["input"][1]["content"]
 
@@ -1002,5 +1010,10 @@ def test_teach_step_caps_output_and_delimits_untrusted_evidence():
     request = service.client.responses.calls[0]
     assert request["max_output_tokens"] == TEACH_MAX_OUTPUT_TOKENS
     assert "untrusted reference data" in request["input"][0]["content"].lower()
+    assert "if the stored graph context is empty, do not invent concept relations" in (
+        request["input"][0]["content"].lower()
+    )
+    assert "github-flavored markdown table" in request["input"][0]["content"].lower()
+    assert "$inline$" in request["input"][0]["content"]
     assert "<evidence>" in request["input"][1]["content"]
     assert "<graph_context>" in request["input"][1]["content"]

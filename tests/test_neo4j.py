@@ -4,6 +4,12 @@ from config.settings import Settings
 from database.semantic_dag import Neo4jManager
 
 
+def test_neo4j_relation_maps_alias_and_skips_garbage():
+    assert Neo4jManager._relation("extends") == "BASED_ON"
+    assert Neo4jManager._relation("FINE_TUNES") == "FINE_TUNES"
+    assert Neo4jManager._relation("not a relation!") == ""
+
+
 def test_concepts_merge_across_sources_and_traverse():
     manager = Neo4jManager(Settings())
     prefix = f"test-{uuid.uuid4().hex}"
@@ -56,7 +62,7 @@ def test_concepts_merge_across_sources_and_traverse():
             }
         ]
         assert subgraph["prerequisites"] == [matrix]
-        assert subgraph["related_concepts"] == [qlora]
+        assert subgraph["related_concepts"] == []
         test_edges = [
             edge
             for edge in visual["edges"]
@@ -64,7 +70,7 @@ def test_concepts_merge_across_sources_and_traverse():
         ]
         assert {edge["label"] for edge in test_edges} == {
             "PREREQUISITE_OF",
-            "RELATES_TO",
+            "BASED_ON",
         }
     finally:
         with manager.driver.session() as session:
@@ -226,6 +232,76 @@ def test_graph_context_filters_relationship_provenance_by_source_prefix():
         assert relation_pairs(manager.get_graph_context([anchor], search_mode="semi_search")) == (
             expected_first | expected_second
         )
+    finally:
+        with manager.driver.session() as session:
+            session.run(
+                "MATCH (c:Concept) WHERE c.id STARTS WITH $prefix DETACH DELETE c",
+                prefix=prefix,
+            )
+        manager.close()
+
+
+def test_one_hop_returns_both_directions_and_respects_source_prefix():
+    manager = Neo4jManager(Settings())
+    prefix = f"test-{uuid.uuid4().hex}"
+    concept = f"{prefix}-C"
+    method = f"{prefix}-M"
+    system = f"{prefix}-S"
+    distant = f"{prefix}-D"
+    paper_source = {"source": f"{prefix}-paper.pdf", "section": "Method"}
+    other_source = {"source": f"{prefix}-other.pdf", "section": "Background"}
+
+    def relation_pairs(context):
+        return {(item["source"], item["relation"], item["target"]) for item in context}
+
+    try:
+        manager.verify_connection()
+        manager.save_knowledge_graph(
+            nodes=[
+                {"name": method},
+                {"name": concept},
+                {"name": system},
+                {"name": distant},
+            ],
+            edges=[
+                {"source": method, "target": concept, "relation": "USES"},
+                {"source": concept, "target": system, "relation": "PART_OF"},
+                {"source": system, "target": distant, "relation": "RELATES_TO"},
+            ],
+            source=paper_source,
+            main_entities=[],
+        )
+        manager.save_knowledge_graph(
+            nodes=[{"name": method}, {"name": concept}],
+            edges=[
+                {"source": method, "target": concept, "relation": "BASED_ON"},
+            ],
+            source=other_source,
+            main_entities=[],
+        )
+
+        expected_both = {
+            (method, "USES", concept),
+            (concept, "PART_OF", system),
+        }
+        assert relation_pairs(
+            manager.get_graph_context(
+                [concept], search_mode="one_hop", source=paper_source["source"]
+            )
+        ) == expected_both
+
+        assert relation_pairs(
+            manager.get_graph_context(
+                [concept], search_mode="one_hop", source=other_source["source"]
+            )
+        ) == {(method, "BASED_ON", concept)}
+
+        # one_hop must not walk a second hop (system → distant)
+        unfiltered = manager.get_graph_context([concept], search_mode="one_hop")
+        endpoints = {item["source"] for item in unfiltered} | {
+            item["target"] for item in unfiltered
+        }
+        assert distant not in endpoints
     finally:
         with manager.driver.session() as session:
             session.run(

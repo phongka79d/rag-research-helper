@@ -423,6 +423,50 @@ def test_bulk_curriculum_persistence_batches_roadmap_and_parent(monkeypatch):
         delete_store(store)
 
 
+def test_upsert_compiled_section_embeds_curriculum_and_questions_once():
+    store = make_store()
+    try:
+        parent_id = "a" * 32
+        metadata = {
+            "source": "lora.md",
+            "section": "Method",
+            "seq_id": 1,
+            "page_start": 3,
+            "page_end": 4,
+            "content_hash": "current-content",
+        }
+        text = "LoRA freezes the base model weights."
+        store.upsert_compiled_section(
+            [
+                {
+                    "seq_id": 0,
+                    "title": "Mechanism",
+                    "content_focus": "low-rank updates",
+                    "concepts": ["LoRA"],
+                }
+            ],
+            text,
+            metadata,
+            metadata,
+            parent_id,
+            [
+                {
+                    "question": "Which LoRA weights stay frozen?",
+                    "key_knowledge": "The base model weights remain frozen.",
+                }
+            ],
+            "lora.md",
+        )
+
+        assert store.llm.embed_many_calls == [
+            ["low-rank updates", text, "Which LoRA weights stay frozen?"]
+        ]
+        assert store.get_section_exact("lora.md", "Method")
+        assert store.client.count(store.questions_collection, exact=True).count == 1
+    finally:
+        delete_store(store)
+
+
 def test_bulk_curriculum_parent_still_resolves_from_question_retrieval():
     store = make_store()
     try:

@@ -1,4 +1,12 @@
-"""Run minimal retrieval ablations over data/eval.json."""
+"""Retrieval evaluation over a labeled question dataset.
+
+Default dataset is ``data/eval.json`` (legacy/demo cases). The three-real-paper
+retrieval benchmark is ``data/eval_real_papers.json``. Recall and MRR measure
+parent-section retrieval quality only; they are not graph-edge precision.
+
+Use ``--graph-sample`` to list unique stored Concept edges from Neo4j without
+running retrieval metrics or an LLM judge.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +33,7 @@ DEFAULT_QDRANT_SEARCH_LIMIT = 25
 DEFAULT_QDRANT_MAX_CANDIDATE_PARENTS = 5
 FINAL_PARENT_LIMIT = 2
 
+# Legacy/demo default; prefer data/eval_real_papers.json for the three real PDFs.
 DATASET_PATH = Path("data/eval.json")
 RESULTS_PATH = Path("eval_results.json")
 
@@ -34,6 +43,50 @@ def expected_parent_ids(case: dict[str, Any]) -> set[str]:
         make_parent_id({"source": item["source"], "section": item["section"]})
         for item in case["expected"]
     }
+
+
+def unique_visual_graph_edges(
+    graph: dict[str, Any] | list[dict[str, Any]],
+) -> list[tuple[str, str, str]]:
+    """Return unique (source, relation, target) triples from a visual-graph payload."""
+    edges = graph.get("edges", []) if isinstance(graph, dict) else graph
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[tuple[str, str, str]] = []
+    for edge in edges:
+        relation = (
+            edge.get("label")
+            or edge.get("relation")
+            or edge.get("type")
+            or ""
+        )
+        triple = (
+            str(edge.get("source", "")).strip(),
+            str(relation).strip(),
+            str(edge.get("target", "")).strip(),
+        )
+        if not all(triple) or triple in seen:
+            continue
+        seen.add(triple)
+        unique.append(triple)
+    return unique
+
+
+def sample_stored_graph_edges(
+    dag: Any, sources: list[str] | None = None
+) -> list[tuple[str, str, str]]:
+    """List unique stored Concept edges via ``get_visual_graph`` (no LLM judge)."""
+    if not sources:
+        return unique_visual_graph_edges(dag.get_visual_graph())
+    seen: set[tuple[str, str, str]] = set()
+    ordered: list[tuple[str, str, str]] = []
+    for source_name in sources:
+        graph = dag.get_visual_graph(source=source_name)
+        for triple in unique_visual_graph_edges(graph):
+            if triple in seen:
+                continue
+            seen.add(triple)
+            ordered.append(triple)
+    return ordered
 
 
 def retrieval_metrics(
@@ -298,19 +351,56 @@ def run_evaluation(dataset_path: Path = DATASET_PATH, workers: int = 4) -> dict[
         "note": (
             "Graph context enriches answer generation after retrieval, so its Recall@2 and "
             "MRR match runtime retrieval; average_graph_edges reports the added context. "
-            "Recall@5 is retained only for the direct parent-vector baseline."
+            "Recall@5 is retained only for the direct parent-vector baseline. "
+            "Recall and MRR are retrieval metrics, not graph-edge precision; use "
+            "--graph-sample to list unique stored Concept edges."
         ),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=DATASET_PATH,
+        help=(
+            "Question dataset path. Default is data/eval.json (legacy/demo). "
+            "Use data/eval_real_papers.json for the three-real-paper retrieval benchmark."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=RESULTS_PATH)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--qdrant-limit", type=int, default=None)
     parser.add_argument("--max-candidates", type=int, default=None)
+    parser.add_argument(
+        "--graph-sample",
+        action="store_true",
+        help=(
+            "List unique stored Concept edges (source, relation, target) from Neo4j "
+            "instead of running retrieval evaluation. No LLM judge."
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=None,
+        dest="sources",
+        help="Paper source for --graph-sample (repeatable). Omit to sample the full graph.",
+    )
     args = parser.parse_args()
+    if args.graph_sample:
+        settings = Settings()
+        settings.validate()
+        dag = Neo4jManager(settings)
+        dag.verify_connection()
+        try:
+            triples = sample_stored_graph_edges(dag, args.sources)
+        finally:
+            dag.close()
+        for source_concept, relation, target_concept in triples:
+            print(f"{source_concept} —{relation}→ {target_concept}")
+        return
     if args.qdrant_limit is not None or args.max_candidates is not None:
         import os
 

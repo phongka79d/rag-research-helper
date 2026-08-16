@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-ALLOWED_RELATIONS = {"PREREQUISITE_OF", "RELATES_TO", "PART_OF", "DESCRIBES"}
+from core.relations import CANONICAL_RELATIONS, normalize_relation as canonicalize_relation
+
+ALLOWED_RELATIONS = CANONICAL_RELATIONS
 MAX_GRAPH_VERIFIER_CANDIDATES = 12
 
 
@@ -22,8 +24,10 @@ class GraphEdge(BaseModel):
     @field_validator("relation")
     @classmethod
     def normalize_relation(cls, relation: str) -> str:
-        normalized = relation.strip().upper().replace(" ", "_")
-        return normalized if normalized in ALLOWED_RELATIONS else "RELATES_TO"
+        normalized = canonicalize_relation(relation)
+        if not normalized:
+            raise ValueError("relation must be an upper-snake identifier.")
+        return normalized
 
 
 class GraphEdgeApproval(BaseModel):

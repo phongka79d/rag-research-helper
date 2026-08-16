@@ -6,7 +6,7 @@ from typing import Any
 
 from neo4j import GraphDatabase
 
-from core.schemas import ALLOWED_RELATIONS
+from core.relations import normalize_relation
 
 
 class Neo4jManager:
@@ -40,8 +40,7 @@ class Neo4jManager:
 
     @staticmethod
     def _relation(value: Any) -> str:
-        relation = str(value or "RELATES_TO").strip().upper().replace(" ", "_")
-        return relation if relation in ALLOWED_RELATIONS else "RELATES_TO"
+        return normalize_relation(value)
 
     def save_knowledge_graph(
         self,
@@ -94,6 +93,8 @@ class Neo4jManager:
                 if not source_name or not target_name:
                     continue
                 relation = self._relation(edge.get("relation"))
+                if not relation:
+                    continue
                 session.run(
                     f"""
                     MATCH (source:Concept {{id: $source}})
@@ -165,6 +166,21 @@ class Neo4jManager:
                     type(relationship) AS relation,
                     target.id AS target,
                     coalesce(target.description, '') AS target_desc
+            """
+        elif search_mode == "one_hop":
+            query = """
+                MATCH (anchor:Concept)-[relationship]-(other:Concept)
+                WHERE anchor.id IN $names
+                    AND (
+                        $source_prefix = ''
+                        OR any(locator IN coalesce(relationship.source_locators, [])
+                            WHERE locator STARTS WITH $source_prefix)
+                    )
+                RETURN DISTINCT startNode(relationship).id AS source,
+                    coalesce(startNode(relationship).description, '') AS source_desc,
+                    type(relationship) AS relation,
+                    endNode(relationship).id AS target,
+                    coalesce(endNode(relationship).description, '') AS target_desc
             """
         else:
             query = """

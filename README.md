@@ -83,6 +83,7 @@ Do not casually reset or delete local Neo4j volumes: they can contain existing g
 
 - The Graph tab queries `Neo4jManager.get_visual_graph(locator)` and renders concepts and relationships as tables.
 - `evaluate.py` compares the direct parent-section vector baseline with the same hypothetical-question retrieval and two-parent fusion used by Ask. It reports baseline Recall@5, runtime Recall@2 and MRR, all-expected-sources coverage, retrieval latency, graph-context size, fixed four-way rerank provenance rates, and effective bounded retrieval capacities in `eval_results.json`.
+- Recall and MRR measure parent-section retrieval only; they are not graph-edge precision. Use `python evaluate.py --graph-sample` (optional repeated `--source`) to list unique stored Concept edges from Neo4j without an LLM judge.
 
 ## Architecture
 
@@ -109,7 +110,7 @@ The key storage model is deliberately narrow:
 
 - Qdrant collection `research_curriculum`: `section_anchor` and `roadmap_step` points.
 - Qdrant collection `research_questions`: hypothetical question points with a `parent_id`.
-- Neo4j: only `Concept` nodes and `PREREQUISITE_OF`, `RELATES_TO`, `PART_OF`, or `DESCRIBES` edges.
+- Neo4j: `Concept` nodes and mapped research relations (`PART_OF`, `USES`, `EVALUATED_ON`, and the rest of the wording table), plus a well-formed novel relation when no table row matches.
 
 ## Frontend
 
@@ -129,8 +130,8 @@ The key storage model is deliberately narrow:
 | Qdrant | Parent sections, roadmap steps, and hypothetical question retrieval | `database/structural_db.py` |
 | Neo4j | Shared research concepts and bounded graph context | `database/semantic_dag.py` |
 | `data/papers/` | Uploaded/local paper files | `main.py` |
-| `data/eval.json` | Legacy/demo evaluation cases | `evaluate.py` |
-| `data/eval_real_papers.json` | Three-real-paper evaluation cases | `evaluate.py` |
+| `data/eval.json` | Legacy/demo retrieval evaluation cases (CLI default) | `evaluate.py` |
+| `data/eval_real_papers.json` | Three-real-paper retrieval benchmark | `evaluate.py` |
 
 ## Configuration
 
@@ -270,28 +271,31 @@ Run the behavior-focused suite:
 python -m pytest -q
 ```
 
-Run the evaluation against the ingested evaluation corpus:
+Run retrieval evaluation. The CLI default dataset is `data/eval.json`
+(legacy/demo). The three-real-paper retrieval benchmark is
+`data/eval_real_papers.json`.
 
 ```powershell
+# Legacy/demo cases (default dataset path)
 python evaluate.py --workers 4 --output eval_results.json
-```
 
-For a score covering only the supplied real papers, force-ingest those three
-PDFs once and run the dedicated corpus separately:
-
-```powershell
+# Three-real-paper retrieval benchmark (after those PDFs are ingested)
 python evaluate.py --dataset data/eval_real_papers.json --workers 1 --output eval_results_real_papers.json
 ```
 
-The legacy `data/eval.json` and `eval_results.json` remain available for
-comparison; they include earlier demo-paper cases and are not the dedicated
-three-real-paper score.
+Reported Recall@5 / Recall@2 / MRR are parent-section retrieval metrics. They
+are not graph-edge precision. To inspect unique stored Concept edges for named
+papers (no LLM judge), use:
 
-The evaluation requires reachable Qdrant and Neo4j services, a configured
-OpenAI-compatible provider key, and the sections referenced by the selected
-dataset to be ingested. It does not automatically retry failed cases; compare
-the reported effective limits and provenance rates when interpreting quality
-and latency changes.
+```powershell
+python evaluate.py --graph-sample --source attention.pdf --source qlora_paper.pdf
+```
+
+Omit `--source` to sample the full Neo4j concept graph. The evaluation path
+requires reachable Qdrant and Neo4j, a configured OpenAI-compatible provider
+key, and the sections referenced by the selected dataset to be ingested.
+`--graph-sample` needs only Neo4j. Cases are not automatically retried; compare
+effective limits and provenance rates when interpreting quality and latency.
 
 ## Development Notes for AI Agents
 

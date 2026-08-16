@@ -1,4 +1,10 @@
-from runtime.engine import MAX_EVIDENCE_CHARS_PER_SECTION, RuntimeEngine, build_sources
+from runtime.engine import (
+    MAX_EVIDENCE_CHARS_PER_SECTION,
+    RuntimeEngine,
+    build_sources,
+    iter_research_display_blocks,
+    normalize_research_markdown,
+)
 
 
 class FakeDB:
@@ -122,11 +128,57 @@ def test_teach_uses_original_section_and_step_concepts():
         "Lesson: Mechanism",
     ]
     assert dag.calls == [
-        (["LoRA"], "semi_search", "lora.pdf"),
-        (["Matrix"], "semi_search", "lora.pdf"),
+        (["LoRA"], "one_hop", "lora.pdf"),
+        (["Matrix"], "one_hop", "lora.pdf"),
     ]
     assert all(call["section_text"] == "LoRA freezes base weights." for call in llm.teach_args)
+    assert [lesson["graph_context"] for lesson in lessons] == [
+        dag.graph_context,
+        dag.graph_context,
+    ]
+
+
+def test_ask_stays_on_search_while_teach_uses_one_hop():
+    llm = FakeLLM()
+    dag = FakeDAG()
+    engine = RuntimeEngine(llm, FakeDB([section()]), dag)
+
+    engine.ask("How does LoRA work?", "lora.pdf")
+    assert dag.calls == [(["LoRA", "Matrix"], "search", "lora.pdf")]
+
+    dag.calls.clear()
+    engine.teach_section("lora.pdf", "Method")
+    assert all(mode == "one_hop" for _, mode, _ in dag.calls)
+    assert dag.calls == [
+        (["LoRA"], "one_hop", "lora.pdf"),
+        (["Matrix"], "one_hop", "lora.pdf"),
+    ]
 
 
 def test_source_formatting_deduplicates_repeated_sections():
     assert build_sources([section(), section()]) == ["[lora.pdf — Method, p.4–5]"]
+
+
+def test_normalize_research_markdown_converts_latex_delimiters_and_pipe_tables():
+    normalized = normalize_research_markdown(
+        "Scale by \\(\\frac{1}{\\sqrt{d_k}}\\).\n"
+        "\\[\nAttention(Q,K,V)=\\mathrm{softmax}(QK^T)\\V\n\\]\n"
+        "Heads:\n"
+        "| head | d_k |\n"
+        "| 8 | 64 |"
+    )
+    assert "$\\frac{1}{\\sqrt{d_k}}$" in normalized
+    assert "$$\nAttention(Q,K,V)=\\mathrm{softmax}(QK^T)\\V\n$$" in normalized
+    assert "| head | d_k |" in normalized
+    assert "|---|---|" in normalized
+
+
+def test_iter_research_display_blocks_splits_display_math_from_prose():
+    blocks = iter_research_display_blocks(
+        "The scaled score is\n\\[\\frac{QK^T}{\\sqrt{d_k}}\\]\nand then softmax."
+    )
+    assert blocks == [
+        ("markdown", "The scaled score is"),
+        ("latex", "\\frac{QK^T}{\\sqrt{d_k}}"),
+        ("markdown", "and then softmax."),
+    ]

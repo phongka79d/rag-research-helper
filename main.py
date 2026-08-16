@@ -13,7 +13,12 @@ from core.data_ingestion import compile_uploaded_document
 from database.semantic_dag import Neo4jManager
 from database.structural_db import QdrantVectorStore
 from orchestrator.llm_service import LLMService
-from runtime.engine import RuntimeEngine
+from runtime.engine import (
+    RuntimeEngine,
+    edges_to_mermaid,
+    format_graph_context_lines,
+    iter_research_display_blocks,
+)
 
 PAPERS_DIR = Path("data/papers")
 INGESTION_SUMMARY_KEY = "ingestion_summary"
@@ -78,6 +83,18 @@ def build_ingestion_summary(
         "retained_relationships": relationship_counts["retained"],
         "elapsed_seconds": elapsed_seconds,
     }
+
+
+def render_research_markdown(text: Any) -> None:
+    """Show Ask/Teach text with GFM tables and KaTeX display formulas."""
+    blocks = iter_research_display_blocks(text)
+    if not blocks:
+        return
+    for kind, body in blocks:
+        if kind == "latex":
+            st.latex(body)
+        else:
+            st.markdown(body)
 
 
 def main() -> None:
@@ -171,14 +188,16 @@ def main() -> None:
             try:
                 with st.spinner("Finding evidence and concept context..."):
                     result = engine.ask(query.strip(), target_file=target_file)
-                st.markdown(result["answer"])
+                render_research_markdown(result["answer"])
                 if result["sources"]:
                     st.caption("Sources")
                     for source in result["sources"]:
                         st.write(source)
-                if result["graph_context"]:
+                context_lines = format_graph_context_lines(result.get("graph_context"))
+                if context_lines:
                     with st.expander("Concept graph context"):
-                        st.json(result["graph_context"])
+                        for line in context_lines:
+                            st.write(line)
             except Exception as error:
                 st.error(str(error))
 
@@ -203,7 +222,14 @@ def main() -> None:
                         st.subheader(
                             f"{lesson['step'].get('seq_id', 0) + 1}. {lesson['step']['title']}"
                         )
-                        st.markdown(lesson["content"])
+                        render_research_markdown(lesson["content"])
+                        context_lines = format_graph_context_lines(
+                            lesson.get("graph_context")
+                        )
+                        if context_lines:
+                            with st.expander("Concept graph context"):
+                                for line in context_lines:
+                                    st.write(line)
                 except Exception as error:
                     st.error(str(error))
 
@@ -227,6 +253,9 @@ def main() -> None:
             else:
                 graph = dag.get_visual_graph(f"{graph_paper}::{graph_section}")
             st.caption(f"{len(graph['nodes'])} concepts, {len(graph['edges'])} relationships")
+            mermaid = edges_to_mermaid(graph)
+            if mermaid and mermaid != "graph LR":
+                st.markdown(f"```mermaid\n{mermaid}\n```")
             st.subheader("Concepts")
             st.dataframe(graph["nodes"], use_container_width=True, hide_index=True)
             st.subheader("Relationships")

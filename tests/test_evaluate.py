@@ -10,7 +10,9 @@ from evaluate import (
     expected_parent_ids,
     retrieval_metrics,
     runtime_metrics,
+    sample_stored_graph_edges,
     summarize_method,
+    unique_visual_graph_edges,
 )
 
 
@@ -48,6 +50,68 @@ def test_graph_summary_preserves_retrieval_metrics_and_reports_context():
     result = summarize_method([["parent"]], [{"parent"}], graph_edges=[3])
 
     assert result == {"recall_at_5": 1.0, "mrr": 1.0, "average_graph_edges": 3}
+
+
+def test_unique_visual_graph_edges_dedupes_and_accepts_label_aliases():
+    edges = unique_visual_graph_edges(
+        {
+            "edges": [
+                {"source": "Attention", "label": "PART_OF", "target": "Transformer"},
+                {"source": "Attention", "label": "PART_OF", "target": "Transformer"},
+                {"source": "LoRA", "relation": "USES", "target": "low-rank adapters"},
+                {"source": "", "label": "USES", "target": "x"},
+                {"source": "A", "type": "ENABLES", "target": "B"},
+            ]
+        }
+    )
+
+    assert edges == [
+        ("Attention", "PART_OF", "Transformer"),
+        ("LoRA", "USES", "low-rank adapters"),
+        ("A", "ENABLES", "B"),
+    ]
+
+
+def test_sample_stored_graph_edges_uses_source_filter_and_uniquifies():
+    class FakeDAG:
+        def __init__(self):
+            self.calls: list[dict[str, str | None]] = []
+
+        def get_visual_graph(self, locator=None, *, source=None):
+            self.calls.append({"locator": locator, "source": source})
+            if source == "a.pdf":
+                return {
+                    "edges": [
+                        {"source": "X", "label": "USES", "target": "Y"},
+                        {"source": "X", "label": "USES", "target": "Y"},
+                    ]
+                }
+            if source == "b.pdf":
+                return {
+                    "edges": [
+                        {"source": "X", "label": "USES", "target": "Y"},
+                        {"source": "P", "label": "PART_OF", "target": "Q"},
+                    ]
+                }
+            return {
+                "edges": [
+                    {"source": "All", "label": "DESCRIBES", "target": "Graph"},
+                ]
+            }
+
+    dag = FakeDAG()
+
+    assert sample_stored_graph_edges(dag) == [("All", "DESCRIBES", "Graph")]
+    assert dag.calls[-1] == {"locator": None, "source": None}
+
+    assert sample_stored_graph_edges(dag, ["a.pdf", "b.pdf"]) == [
+        ("X", "USES", "Y"),
+        ("P", "PART_OF", "Q"),
+    ]
+    assert dag.calls[-2:] == [
+        {"locator": None, "source": "a.pdf"},
+        {"locator": None, "source": "b.pdf"},
+    ]
 
 
 def test_runtime_metrics_measure_parent_coverage_sources_latency_and_mrr():

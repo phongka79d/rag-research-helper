@@ -6,16 +6,24 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import md5, sha256
 from pathlib import Path
+import json
 import re
 from typing import Any
 
 from pydantic import ValidationError
 
+from core.relations import (
+    RELATION_CUE_WORDS,
+    compile_local_pair_patterns,
+    is_concept_endpoint as _is_concept_endpoint,
+    normalize_relation,
+    normalized_phrase as _normalized_phrase,
+    quote_supports_relation as _quote_supports_relation,
+)
 from core.schemas import MAX_GRAPH_VERIFIER_CANDIDATES
 from database.document_processor import DocumentProcessor
 
 
-_NON_ALPHANUMERIC = re.compile(r"[\W_]+", re.UNICODE)
 _DIRECT_WHOLE_PART_CUE = re.compile(
     r"(?:consists\s+of|is\s+composed\s+of|"
     r"is\s+made\s+up\s+of|is\s+(?:an?\s+|the\s+)?(?:component|part|layer|"
@@ -35,6 +43,8 @@ _MAX_EVIDENCE_SPAN_CHARS = 500
 # Bounded retained-edge audit for diagnostics only (not Neo4j persistence).
 _MAX_RETAINED_EDGE_AUDIT = 10
 _MAX_EVIDENCE_PREVIEW_CHARS = 120
+# Sections shorter than this still persist text/plan; skip graph extract/verify.
+_MIN_GRAPH_SECTION_CHARS = 200
 _SENTENCE_BOUNDARY = re.compile(
     r"([.!?]+)([)\]\"'\u2019\u201d]*)(?:\s+|$)"
 )
@@ -44,14 +54,17 @@ _MD_STRUCTURAL_LINE = re.compile(
 )
 # Generic noun phrase for local graph scan: optional article + short token run.
 # Tokens exclude closed-class/relation-cue words so endpoints stay concise.
-_LOCAL_GRAPH_NP_WORD = (
-    r"(?!(?:is|are|was|were|be|been|being|a|an|the|of|in|within|and|or|to|for|"
+_LOCAL_GRAPH_CLOSED_CLASS = (
+    r"is|are|was|were|be|been|being|a|an|the|of|in|within|and|or|to|for|"
     r"by|as|on|at|from|with|into|onto|one|how|between|before|after|must|need|"
-    r"needs|required|necessary|prerequisite|understanding|learning|understand|"
-    r"learn|you|we|related|relationship|relation|directly|closely|explains|"
-    r"defines|describes|explained|defined|described|contains|includes|comprises|"
-    r"consists|composed|made|up|forms?|form|not|no|nor|overall|here|there|"
-    r"also|then|thus|therefore|respectively)\b)"
+    r"you|we|up|need|not|no|nor|overall|here|there|also|then|thus|"
+    r"therefore|respectively"
+)
+_LOCAL_GRAPH_CUE_ALTERNATION = "|".join(
+    re.escape(word) for word in RELATION_CUE_WORDS
+)
+_LOCAL_GRAPH_NP_WORD = (
+    rf"(?!(?:{_LOCAL_GRAPH_CLOSED_CLASS}|{_LOCAL_GRAPH_CUE_ALTERNATION})\b)"
     r"[A-Za-z0-9][A-Za-z0-9\-]*"
 )
 _LOCAL_GRAPH_NP = (
@@ -272,172 +285,18 @@ def build_evidence_spans(section_text: str) -> list[dict]:
     return spans
 
 
-def _normalized_phrase(value: Any) -> str:
-    """Normalize model terms and source text for conservative phrase matching."""
-    return " ".join(_NON_ALPHANUMERIC.sub(" ", str(value).casefold()).split())
-
-
 def _is_grounded_name(name: Any, normalized_section: str) -> bool:
     phrase = _normalized_phrase(name)
     return bool(phrase) and f" {phrase} " in f" {normalized_section} "
 
 
-def _evidence_term(value: str) -> str:
-    """Match a normalized endpoint without allowing it to absorb surrounding words."""
-    return rf"(?<!\w)(?:an? |the )?{re.escape(_normalized_phrase(value))}(?!\w)"
-
-
-def _quote_supports_relation(
-    quote: str, source: str, relation: Any, target: str
-) -> bool:
-    """Fail closed unless the verifier quote directly asserts its proposed edge."""
-    source_term = _evidence_term(source)
-    target_term = _evidence_term(target)
-    relation_quote = _normalized_phrase(
-        re.sub(r"[.!?;:]+", " relationboundary ", quote)
-    )
-    if not relation_quote:
-        return False
-
-    def matches(patterns: list[str]) -> bool:
-        return any(re.search(pattern, relation_quote) for pattern in patterns)
-
-    normalized_relation = str(relation or "").strip().upper()
-    if normalized_relation == "PART_OF":
-        optional_article = r"(?:an?\s+|the\s+)?"
-        return matches(
-            [
-                rf"{source_term}\s+(?:is|are|was|were)\s+(?:an? |the |one of the )?"
-                rf"(?:components?|parts?|layers?|modules?|elements?|subcomponents?|"
-                rf"constituents?|subunits?)\s+(?:of|in|within)\s+{target_term}",
-                rf"{source_term}\s+(?:forms?|form)\s+(?:an? )?part\s+of\s+{target_term}",
-                rf"{target_term}\s+(?:contains|includes|comprises)\s+{optional_article}{source_term}",
-                rf"{target_term}\s+(?:consists\s+of|is\s+composed\s+of|is\s+made\s+up\s+of)\s+{optional_article}{source_term}",
-            ]
-        )
-    if normalized_relation == "PREREQUISITE_OF":
-        return matches(
-            [
-                rf"(?:understanding|learning)(?:\s+of)?\s+{source_term}\s+(?:is\s+)?"
-                rf"(?:an?\s+)?(?:prerequisite|required|necessary)\s+(?:before|for)\s+"
-                rf"(?:understanding|learning)(?:\s+of)?\s+{target_term}",
-                rf"(?:understanding|learning)(?:\s+of)?\s+{target_term}\s+"
-                rf"(?:requires|needs)\s+(?:understanding|learning)(?:\s+of)?\s+{source_term}",
-                rf"before\s+(?:understanding|learning)(?:\s+of)?\s+{target_term}\s+"
-                rf"(?:one|you|we)\s+(?:must|need to)\s+(?:understand|learn)\s+{source_term}",
-            ]
-        )
-    if normalized_relation == "DESCRIBES":
-        return matches(
-            [
-                rf"{source_term}\s+(?:explains|defines|describes)\s+(?:how\s+)?{target_term}",
-                rf"{target_term}\s+(?:is|are)\s+(?:explained|defined|described)\s+by\s+{source_term}",
-            ]
-        )
-    if normalized_relation == "RELATES_TO":
-        return matches(
-            [
-                rf"{source_term}\s+(?:is|are|was|were)?\s*(?:directly\s+|closely\s+)?related\s+to\s+{target_term}",
-                rf"{target_term}\s+(?:is|are|was|were)?\s*(?:directly\s+|closely\s+)?related\s+to\s+{source_term}",
-                rf"{source_term}\s+and\s+{target_term}\s+(?:are|is)\s+related",
-                rf"{target_term}\s+and\s+{source_term}\s+(?:are|is)\s+related",
-                rf"(?:relationship|relation)\s+between\s+{source_term}\s+and\s+{target_term}",
-                rf"(?:relationship|relation)\s+between\s+{target_term}\s+and\s+{source_term}",
-            ]
-        )
-    return False
-
-
 def _local_graph_pair_patterns() -> list[tuple[re.Pattern[str], str, int, int]]:
-    """Inverted relation patterns: (regex, relation, source_group, target_group)."""
-    np = _LOCAL_GRAPH_NP
-    opt_art = _LOCAL_GRAPH_OPT_ART
-    raw: list[tuple[str, str, int, int]] = [
-        (
-            rf"{np}\s+(?:is|are|was|were)\s+(?:an?\s+|the\s+|one\s+of\s+the\s+)?"
-            rf"(?:components?|parts?|layers?|modules?|elements?|subcomponents?|"
-            rf"constituents?|subunits?)\s+(?:of|in|within)\s+{np}",
-            "PART_OF",
-            1,
-            2,
-        ),
-        (
-            rf"{np}\s+(?:forms?|form)\s+(?:an?\s+)?part\s+of\s+{np}",
-            "PART_OF",
-            1,
-            2,
-        ),
-        (
-            rf"{np}\s+(?:contains|includes|comprises)\s+{opt_art}{np}",
-            "PART_OF",
-            2,
-            1,
-        ),
-        (
-            rf"{np}\s+(?:consists\s+of|is\s+composed\s+of|is\s+made\s+up\s+of)\s+"
-            rf"{opt_art}{_LOCAL_GRAPH_COMPOSED_PART}",
-            "PART_OF",
-            2,
-            1,
-        ),
-        (
-            rf"(?:understanding|learning)(?:\s+of)?\s+{np}\s+(?:is\s+)?"
-            rf"(?:an?\s+)?(?:prerequisite|required|necessary)\s+(?:before|for)\s+"
-            rf"(?:understanding|learning)(?:\s+of)?\s+{np}",
-            "PREREQUISITE_OF",
-            1,
-            2,
-        ),
-        (
-            rf"(?:understanding|learning)(?:\s+of)?\s+{np}\s+"
-            rf"(?:requires|needs)\s+(?:understanding|learning)(?:\s+of)?\s+{np}",
-            "PREREQUISITE_OF",
-            2,
-            1,
-        ),
-        (
-            rf"before\s+(?:understanding|learning)(?:\s+of)?\s+{np}\s+"
-            rf"(?:one|you|we)\s+(?:must|need\s+to)\s+(?:understand|learn)\s+{np}",
-            "PREREQUISITE_OF",
-            2,
-            1,
-        ),
-        (
-            rf"{np}\s+(?:explains|defines|describes)\s+(?:how\s+)?{np}",
-            "DESCRIBES",
-            1,
-            2,
-        ),
-        (
-            rf"{np}\s+(?:is|are)\s+(?:explained|defined|described)\s+by\s+{np}",
-            "DESCRIBES",
-            2,
-            1,
-        ),
-        (
-            rf"{np}\s+(?:(?:is|are|was|were)\s+)?(?:(?:directly|closely)\s+)?"
-            rf"related\s+to\s+{np}",
-            "RELATES_TO",
-            1,
-            2,
-        ),
-        (
-            rf"{np}\s+and\s+{np}\s+(?:are|is)\s+related",
-            "RELATES_TO",
-            1,
-            2,
-        ),
-        (
-            rf"(?:relationship|relation)\s+between\s+{np}\s+and\s+{np}",
-            "RELATES_TO",
-            1,
-            2,
-        ),
-    ]
-    return [
-        (re.compile(pattern, re.IGNORECASE), relation, source_g, target_g)
-        for pattern, relation, source_g, target_g in raw
-    ]
+    """Compile the shared wording table against local noun-phrase macros."""
+    return compile_local_pair_patterns(
+        noun_phrase=_LOCAL_GRAPH_NP,
+        optional_article=_LOCAL_GRAPH_OPT_ART,
+        composed_part=_LOCAL_GRAPH_COMPOSED_PART,
+    )
 
 
 _LOCAL_GRAPH_PAIR_PATTERNS = _local_graph_pair_patterns()
@@ -458,6 +317,8 @@ def _scan_span_for_relation_pairs(span_text: str) -> list[tuple[str, str, str]]:
                 or not target
                 or _normalized_phrase(source) == _normalized_phrase(target)
             ):
+                continue
+            if not _is_concept_endpoint(source) or not _is_concept_endpoint(target):
                 continue
             if not _is_grounded_name(source, normalized_span):
                 continue
@@ -672,6 +533,11 @@ def _span_is_verbatim_slice(section_text: str, span: dict) -> bool:
     return section_text[start:end] == text
 
 
+def _evidence_id_is_window(evidence_id: str) -> bool:
+    """Adjacent-window ids join two span ids with '+' (e.g. e0+e1)."""
+    return "+" in evidence_id
+
+
 def _approved_graph_edges(
     section_text: str,
     candidates: list[dict[str, Any]],
@@ -681,7 +547,11 @@ def _approved_graph_edges(
     audit_sink: list[dict[str, Any]] | None = None,
     locator: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Keep only candidate edges approved against resolved source evidence spans."""
+    """Keep only candidate edges approved against resolved source evidence spans.
+
+    At most one edge per normalized (source, relation, target) is retained.
+    Single-span evidence ids are preferred over adjacent-window ids.
+    """
     def reject(reason: str) -> None:
         if rejection_counts is not None and reason in _GRAPH_REJECTION_KEYS:
             rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
@@ -692,7 +562,8 @@ def _approved_graph_edges(
         evidence_spans = build_evidence_spans(section_text)
     span_by_id = _evidence_span_lookup(evidence_spans)
     normalized_section = _normalized_phrase(section_text)
-    accepted: list[dict[str, Any]] = []
+    # key -> (edge, evidence_id, span_text) for single-triple dedup per section.
+    accepted_by_triple: dict[tuple[str, str, str], tuple[dict[str, Any], str, str]] = {}
     index_counts: dict[int, int] = {}
     for approval in approvals:
         if not isinstance(approval, dict):
@@ -729,7 +600,10 @@ def _approved_graph_edges(
         candidate = candidates[index]
         source = str(candidate.get("source", "")).strip()
         target = str(candidate.get("target", "")).strip()
-        relation = str(candidate.get("relation", "")).strip()
+        relation = normalize_relation(candidate.get("relation"))
+        if not relation:
+            reject("relation_mismatch")
+            continue
         normalized_source = _normalized_phrase(source)
         normalized_target = _normalized_phrase(target)
 
@@ -753,6 +627,8 @@ def _approved_graph_edges(
         if (
             not normalized_source
             or normalized_source == normalized_target
+            or not _is_concept_endpoint(source)
+            or not _is_concept_endpoint(target)
             or not _is_grounded_name(source, normalized_section)
             or not _is_grounded_name(target, normalized_section)
         ):
@@ -769,20 +645,33 @@ def _approved_graph_edges(
         if not _quote_supports_relation(span_text, source, relation, target):
             reject("relation_mismatch")
             continue
-        # Persistence shape only: strip evidence_id and any evidence text.
-        accepted.append(
-            {"source": source, "relation": relation, "target": target}
-        )
-        # Compact outside-Neo4j audit sample; preview is a raw source prefix.
+
+        triple_key = (normalized_source, relation, normalized_target)
+        edge = {"source": source, "relation": relation, "target": target}
+        existing = accepted_by_triple.get(triple_key)
+        if existing is not None:
+            _existing_edge, existing_id, _existing_span = existing
+            # Prefer single-span evidence over adjacent-window (e0+e1) ids.
+            if _evidence_id_is_window(existing_id) and not _evidence_id_is_window(
+                resolved_evidence_id
+            ):
+                accepted_by_triple[triple_key] = (edge, resolved_evidence_id, span_text)
+            # else keep the existing (single-span wins over a later window)
+            continue
+        accepted_by_triple[triple_key] = (edge, resolved_evidence_id, span_text)
+
+    accepted: list[dict[str, Any]] = []
+    for edge, resolved_evidence_id, span_text in accepted_by_triple.values():
+        accepted.append(edge)
         if (
             audit_sink is not None
             and len(audit_sink) < _MAX_RETAINED_EDGE_AUDIT
         ):
             audit_sink.append(
                 {
-                    "source": source,
-                    "relation": relation,
-                    "target": target,
+                    "source": edge["source"],
+                    "relation": edge["relation"],
+                    "target": edge["target"],
                     "locator": locator or "",
                     "evidence_id": resolved_evidence_id,
                     "evidence_preview": span_text[:_MAX_EVIDENCE_PREVIEW_CHARS],
@@ -1057,26 +946,40 @@ def ingest_document(
             plan_extractor = getattr(llm, "extract_section_plan", None)
             graph_extractor = getattr(llm, "extract_section_graph", None)
             use_split_extraction = callable(plan_extractor) and callable(graph_extractor)
-            # Build spans once per compiled section; reuse for extraction, verify, recovery.
-            evidence_spans = build_evidence_spans(full_text)
-            local_candidates, extra_spans = propose_local_graph_candidates(
-                full_text, evidence_spans
-            )
-            gate_spans = list(evidence_spans) + list(extra_spans)
-            use_local_candidates = bool(local_candidates)
-            # Local candidates are the only graph source for this section; skip
-            # extract_section_graph (prefer plan-only when the split boundary exists).
-            if use_local_candidates and callable(plan_extractor):
-                extraction_mode = "plan_only"
-            elif use_local_candidates:
-                extraction_mode = "combined_local"
-            elif use_split_extraction:
-                extraction_mode = "split"
+            # Generic body-length gate: heading stubs skip graph work entirely.
+            thin_section = len(full_text.strip()) < _MIN_GRAPH_SECTION_CHARS
+            if thin_section:
+                evidence_spans = []
+                local_candidates: list[dict] = []
+                extra_spans: list[dict] = []
+                gate_spans: list[dict] = []
+                use_local_candidates = False
+                # Plan (or combined plan+graph stripped) + questions only.
+                if callable(plan_extractor):
+                    extraction_mode = "thin_plan"
+                else:
+                    extraction_mode = "thin_combined"
             else:
-                extraction_mode = "combined"
+                # Build spans once per compiled section; reuse for extraction, verify, recovery.
+                evidence_spans = build_evidence_spans(full_text)
+                local_candidates, extra_spans = propose_local_graph_candidates(
+                    full_text, evidence_spans
+                )
+                gate_spans = list(evidence_spans) + list(extra_spans)
+                use_local_candidates = bool(local_candidates)
+                # Local candidates are the only graph source for this section; skip
+                # extract_section_graph (prefer plan-only when the split boundary exists).
+                if use_local_candidates and callable(plan_extractor):
+                    extraction_mode = "plan_only"
+                elif use_local_candidates:
+                    extraction_mode = "combined_local"
+                elif use_split_extraction:
+                    extraction_mode = "split"
+                else:
+                    extraction_mode = "combined"
             worker_count = 3 if extraction_mode == "split" else 2
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                if extraction_mode == "plan_only":
+                if extraction_mode in {"plan_only", "thin_plan"}:
                     plan_future = executor.submit(
                         plan_extractor,
                         full_text,
@@ -1110,6 +1013,8 @@ def ingest_document(
                     aot = _aot_from_plan_and_local_candidates(
                         plan_future.result(), local_candidates
                     )
+                elif extraction_mode == "thin_plan":
+                    aot = _aot_from_plan_and_local_candidates(plan_future.result(), [])
                 elif extraction_mode == "split":
                     # Plan and questions are independent of graph; an unusable
                     # graph payload must not abort the rest of this section or
@@ -1123,51 +1028,69 @@ def ingest_document(
                         aot = _aot_from_plan_and_local_candidates(plan_payload, [])
                 else:
                     aot = aot_future.result()
+                    if thin_section:
+                        # Combined path still returns a graph; drop it for thin bodies.
+                        aot = {
+                            "main_entities": aot.get("main_entities", [])
+                            if isinstance(aot, dict)
+                            else [],
+                            "learning_roadmap": aot.get("learning_roadmap", [])
+                            if isinstance(aot, dict)
+                            else [],
+                            "knowledge_graph": {"nodes": [], "edges": []},
+                        }
                 aot = filter_aot_to_section(aot, full_text)
                 graph = aot.get("knowledge_graph", {})
                 if not isinstance(graph, dict):
                     graph = {}
                     aot["knowledge_graph"] = graph
-                # Ponytail: omit surplus candidates rather than expanding the
-                # verifier request budget or persisting unverified edges.
-                # Local non-empty scan replaces model graph edges entirely.
-                if use_local_candidates:
-                    candidate_edges = local_candidates[:MAX_GRAPH_VERIFIER_CANDIDATES]
+                if thin_section:
+                    # No local scan, graph extract, or verifier for short bodies.
+                    graph["edges"] = []
+                    graph["nodes"] = []
                 else:
-                    candidate_edges = graph.get("edges", [])[
-                        :MAX_GRAPH_VERIFIER_CANDIDATES
-                    ]
-                graph_relationships["candidates"] += len(candidate_edges)
-                # Local scan already applied the same matcher as the gate.
-                # Calling the verifier (or whole-part recovery) again only
-                # adds latency and can drop already-grounded edges.
-                if use_local_candidates:
-                    approvals = [
-                        {"index": index}
-                        for index in range(len(candidate_edges))
-                    ]
-                elif candidate_edges:
-                    approvals = llm.verify_graph_edges(
+                    # Ponytail: omit surplus candidates rather than expanding the
+                    # verifier request budget or persisting unverified edges.
+                    # Local non-empty scan replaces model graph edges entirely.
+                    if use_local_candidates:
+                        candidate_edges = local_candidates[
+                            :MAX_GRAPH_VERIFIER_CANDIDATES
+                        ]
+                    else:
+                        candidate_edges = graph.get("edges", [])[
+                            :MAX_GRAPH_VERIFIER_CANDIDATES
+                        ]
+                    graph_relationships["candidates"] += len(candidate_edges)
+                    # Local scan already applied the same matcher as the gate.
+                    # Calling the verifier (or whole-part recovery) again only
+                    # adds latency and can drop already-grounded edges.
+                    if use_local_candidates:
+                        approvals = [
+                            {"index": index}
+                            for index in range(len(candidate_edges))
+                        ]
+                    elif candidate_edges:
+                        approvals = llm.verify_graph_edges(
+                            full_text,
+                            candidate_edges,
+                            evidence_spans=gate_spans,
+                        )
+                    else:
+                        approvals = []
+                    graph_relationships["verifier_approvals"] += (
+                        _verifier_approval_count(candidate_edges, approvals)
+                    )
+                    graph["edges"] = _approved_graph_edges(
                         full_text,
                         candidate_edges,
+                        approvals,
+                        local_rejections,
                         evidence_spans=gate_spans,
+                        audit_sink=retained_edge_audit,
+                        locator=label,
                     )
-                else:
-                    approvals = []
+                    graph_relationships["retained"] += len(graph["edges"])
                 questions = questions_future.result()
-                graph_relationships["verifier_approvals"] += _verifier_approval_count(
-                    candidate_edges, approvals
-                )
-                graph["edges"] = _approved_graph_edges(
-                    full_text,
-                    candidate_edges,
-                    approvals,
-                    local_rejections,
-                    evidence_spans=gate_spans,
-                    audit_sink=retained_edge_audit,
-                    locator=label,
-                )
-                graph_relationships["retained"] += len(graph["edges"])
             nodes = graph.get("nodes", [])
             edges = graph.get("edges", [])
 
@@ -1195,14 +1118,26 @@ def ingest_document(
                 "main_entities": aot.get("main_entities", []),
                 "anchor_nodes": collect_anchor_nodes(aot),
             }
-            db.upsert_curriculum_section(
-                roadmap_steps,
-                full_text,
-                metadata,
-                parent_metadata,
-                parent_id,
-            )
-            db.upsert_questions(questions, parent_id, metadata["source"])
+            compiled_writer = getattr(db, "upsert_compiled_section", None)
+            if callable(compiled_writer):
+                compiled_writer(
+                    roadmap_steps,
+                    full_text,
+                    metadata,
+                    parent_metadata,
+                    parent_id,
+                    questions,
+                    metadata["source"],
+                )
+            else:
+                db.upsert_curriculum_section(
+                    roadmap_steps,
+                    full_text,
+                    metadata,
+                    parent_metadata,
+                    parent_id,
+                )
+                db.upsert_questions(questions, parent_id, metadata["source"])
             ingested.append(label)
             completed += 1
             _report_progress(progress_callback, completed, total, label, "compiled")
@@ -1249,6 +1184,21 @@ def ingest_document(
 MINERU_OUTPUT_DIR = Path("data/mineru")
 
 
+def sibling_complete_mineru_manifest(markdown_path: str | Path) -> Path | None:
+    """Return a sibling complete MinerU manifest when the Markdown is that extract."""
+    path = Path(markdown_path)
+    candidate = path.with_name(f"{path.stem}.manifest.json")
+    if not candidate.is_file():
+        return None
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("complete") is not True:
+        return None
+    return candidate
+
+
 def compile_uploaded_document(
     file_path: str | Path,
     db: Any,
@@ -1273,6 +1223,7 @@ def compile_uploaded_document(
             processor=processor,
             force_reingest=force_reingest,
             progress_callback=progress_callback,
+            mineru_manifest_path=sibling_complete_mineru_manifest(path),
         )
     if suffix != ".pdf":
         raise ValueError("Only PDF and Markdown files can be ingested.")

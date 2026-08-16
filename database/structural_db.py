@@ -163,10 +163,12 @@ class QdrantVectorStore:
         roadmap_metadata: dict[str, Any],
         section_metadata: dict[str, Any],
         parent_id: str,
+        vectors: list[list[float]] | None = None,
     ) -> None:
         """Store one section anchor and its roadmap with one embedding and write."""
         embedding_inputs = [step["content_focus"] for step in roadmap_steps] + [text]
-        vectors = self.llm.embed_many(embedding_inputs)
+        if vectors is None:
+            vectors = self.llm.embed_many(embedding_inputs)
         if len(vectors) != len(embedding_inputs):
             raise RuntimeError(
                 "Curriculum embeddings did not match roadmap steps and parent section."
@@ -206,16 +208,57 @@ class QdrantVectorStore:
         )
         self.client.upsert(collection_name=self.curriculum_collection, points=points)
 
+    def upsert_compiled_section(
+        self,
+        roadmap_steps: list[dict[str, Any]],
+        text: str,
+        roadmap_metadata: dict[str, Any],
+        section_metadata: dict[str, Any],
+        parent_id: str,
+        qa_pairs: list[dict[str, str]],
+        source_file: str,
+    ) -> None:
+        """Persist curriculum and questions with one embedding round-trip."""
+        question_pairs = [
+            pair
+            for pair in qa_pairs
+            if isinstance(pair, dict) and str(pair.get("question", "")).strip()
+        ]
+        embedding_inputs = [step["content_focus"] for step in roadmap_steps] + [text]
+        embedding_inputs.extend(pair["question"] for pair in question_pairs)
+        vectors = self.llm.embed_many(embedding_inputs)
+        if len(vectors) != len(embedding_inputs):
+            raise RuntimeError(
+                "Compiled-section embeddings did not match roadmap, parent, and questions."
+            )
+        curriculum_count = len(roadmap_steps) + 1
+        self.upsert_curriculum_section(
+            roadmap_steps,
+            text,
+            roadmap_metadata,
+            section_metadata,
+            parent_id,
+            vectors=vectors[:curriculum_count],
+        )
+        self.upsert_questions(
+            question_pairs,
+            parent_id,
+            source_file,
+            vectors=vectors[curriculum_count:],
+        )
+
     def upsert_questions(
         self,
         qa_pairs: list[dict[str, str]],
         parent_id: str,
         source_file: str,
+        vectors: list[list[float]] | None = None,
     ) -> None:
         if not qa_pairs:
             return
         questions = [pair["question"] for pair in qa_pairs]
-        vectors = self.llm.embed_many(questions)
+        if vectors is None:
+            vectors = self.llm.embed_many(questions)
         if len(vectors) != len(qa_pairs):
             raise RuntimeError("Question embeddings did not match generated questions.")
         points = []

@@ -12,6 +12,7 @@ from core.data_ingestion import (
     compile_uploaded_document,
     filter_aot_to_section,
     ingest_document,
+    sibling_complete_mineru_manifest,
     make_content_hash,
     make_parent_id,
     propose_local_graph_candidates,
@@ -20,17 +21,40 @@ from core.schemas import MAX_GRAPH_VERIFIER_CANDIDATES, SectionAOTResult
 from database.document_processor import DocumentProcessor
 
 
+# Keep body length above the thin-section graph skip threshold (200 chars).
+# Separate paragraph so adjacent-window scan does not join pad sentences.
+_SECTION_PAD = (
+    "\n\nAdditional methodological context and evaluation discussion fill this "
+    "section body so graph compilation still runs under the generic length gate."
+)
 SECTION_TEXT = (
     "LoRA freezes base weights and trains a low-rank matrix. "
     "A low-rank matrix is a component of LoRA."
+    + _SECTION_PAD
 )
+assert len(SECTION_TEXT.strip()) >= 200
 
+
+def _ensure_graph_body(text: str) -> str:
+    """Pad body past the thin-section threshold without adding relation cues."""
+    body = text
+    while len(body.strip()) < 200:
+        if not body.endswith("\n\n") and _SECTION_PAD.startswith("\n\n"):
+            body = body.rstrip() + _SECTION_PAD
+        else:
+            body = body.rstrip() + _SECTION_PAD
+    return body
 
 def make_section(
-    section: str = "Method", text: str = SECTION_TEXT, seq_id: int = 0
+    section: str = "Method",
+    text: str = SECTION_TEXT,
+    seq_id: int = 0,
+    *,
+    allow_thin: bool = False,
 ) -> dict:
+    body = text if allow_thin else _ensure_graph_body(text)
     return {
-        "page_content": text,
+        "page_content": body,
         "metadata": {
             "source": "lora.md",
             "section": section,
@@ -315,11 +339,12 @@ def expected_result(
 ) -> dict:
     if graph_relationships is None:
         # SECTION_TEXT local scan yields the direct PART_OF span plus one
-        # same-paragraph adjacent window; both pass verifier + local gate.
+        # same-paragraph adjacent window; the gate keeps one triple and prefers
+        # the single-span evidence id.
         graph_relationships = {
             "candidates": 2 * int(bool(ingested)),
             "verifier_approvals": 2 * int(bool(ingested)),
-            "retained": 2 * int(bool(ingested)),
+            "retained": 1 * int(bool(ingested)),
         }
         if ingested:
             graph_relationships["retained_edge_audit"] = [
@@ -330,17 +355,6 @@ def expected_result(
                     "locator": ingested[0],
                     "evidence_id": "e1",
                     "evidence_preview": "A low-rank matrix is a component of LoRA.",
-                },
-                {
-                    "source": "low-rank matrix",
-                    "relation": "PART_OF",
-                    "target": "LoRA",
-                    "locator": ingested[0],
-                    "evidence_id": "e0+e1",
-                    "evidence_preview": (
-                        "LoRA freezes base weights and trains a low-rank matrix. "
-                        "A low-rank matrix is a component of LoRA."
-                    ),
                 },
             ]
     return {
@@ -371,7 +385,7 @@ def test_markdown_sections_keep_order_and_metadata():
     }
 
 
-def test_aot_schema_normalizes_unknown_graph_relations():
+def test_aot_schema_keeps_novel_graph_relations():
     result = SectionAOTResult.model_validate(
         {
             "main_entities": ["LoRA"],
@@ -397,7 +411,7 @@ def test_aot_schema_normalizes_unknown_graph_relations():
     )
 
     assert result.learning_roadmap[0].seq_id == 0
-    assert result.knowledge_graph.edges[0].relation == "RELATES_TO"
+    assert result.knowledge_graph.edges[0].relation == "UNKNOWN"
 
 
 def test_ingestion_writes_grounded_aot_in_curriculum_question_order():
@@ -503,9 +517,8 @@ def test_aot_filter_keeps_only_current_section_terms_and_paper_local_reuse():
             "LoRA",
             "Low-Rank Matrix",
         ]
-        # Local-first candidates use span casing for endpoints.
+        # Local-first candidates use span casing; triple dedup keeps one edge.
         assert [edge["source"] for edge in saved["edges"]] == [
-            "low-rank matrix",
             "low-rank matrix",
         ]
     assert filter_aot_to_section(make_aot(include_unsupported=True), SECTION_TEXT)[
@@ -544,6 +557,11 @@ def test_graph_edges_require_valid_grounded_verifier_approval():
         "RELATES_TO",
         "DESCRIBES",
         "PREREQUISITE_OF",
+        "USES",
+        "HAS_FEATURE",
+        "EVALUATED_ON",
+        "BASED_ON",
+        "APPLIED_TO",
     }
 
 
@@ -1072,7 +1090,7 @@ def test_graph_recovery_verifier_failure_is_non_fatal_and_fails_closed():
 
 def test_graph_without_candidate_edges_skips_verifier():
     # Empty local scan + empty model edges: verifier must not run.
-    text = "The system uses a technique."
+    text = "Alpha and Beta appear together."
     aot = {
         "main_entities": ["system", "technique"],
         "learning_roadmap": [],
@@ -1099,9 +1117,10 @@ def test_graph_without_candidate_edges_skips_verifier():
 
 
 def test_ingestion_reports_graph_candidate_approval_and_retained_counts():
-    # One PART_OF local candidate plus a usage sentence that yields no local edge.
-    # Approve only index 0 so the adjacent-window duplicate is not retained.
-    text = "Alpha is part of Beta. Gamma uses Delta."
+    # One PART_OF local candidate plus a co-occurrence sentence that yields no
+    # extra mapped edge. Approve only index 0 so the adjacent-window duplicate
+    # is not retained.
+    text = "Alpha is part of Beta. Gamma and Delta appear together."
     local_candidates, _extra = propose_local_graph_candidates(text)
     assert len(local_candidates) == 2
     aot = {
@@ -1228,8 +1247,8 @@ def test_evidence_fields_do_not_alter_neo4j_qdrant_persistence_shape():
     assert saved["source"] == metadata
     assert saved["source"]["source"] == "lora.md"
     assert saved["source"]["section"] == "Method"
-    # Local scan retains the direct span and the adjacent-window candidate.
-    assert len(saved["edges"]) == 2
+    # Local scan proposes span + window; gate keeps one triple (single-span id).
+    assert len(saved["edges"]) == 1
     assert saved["edges"][0] == {
         "source": "low-rank matrix",
         "relation": "PART_OF",
@@ -1254,17 +1273,6 @@ def test_evidence_fields_do_not_alter_neo4j_qdrant_persistence_shape():
             "evidence_id": "e1",
             "evidence_preview": "A low-rank matrix is a component of LoRA.",
         },
-        {
-            "source": "low-rank matrix",
-            "relation": "PART_OF",
-            "target": "LoRA",
-            "locator": expected_locator,
-            "evidence_id": "e0+e1",
-            "evidence_preview": (
-                "LoRA freezes base weights and trains a low-rank matrix. "
-                "A low-rank matrix is a component of LoRA."
-            ),
-        },
     ]
     assert "retained_edge_audit" not in saved
 
@@ -1282,7 +1290,7 @@ def test_existing_nodes_do_not_leak_across_separate_paper_ingestions():
     """Each ingest_document starts empty; paper A concepts never seed paper B."""
     paper_a = make_section("Method", SECTION_TEXT, 0)
     paper_a["metadata"]["source"] = "paper_a.md"
-    paper_b_text = (
+    paper_b_text = _ensure_graph_body(
         "Adapters freeze the backbone and train a compact update. "
         "A compact update is a component of Adapters."
     )
@@ -1430,7 +1438,7 @@ def test_graph_gate_rejection_reasons_distinguish_evidence_failures():
 
 def test_graph_verifier_request_caps_candidates_conservatively():
     # Empty local scan so the model edge list is the candidate source.
-    text = "The system uses a technique."
+    text = "The system and the technique appear together."
     edge = {
         "source": "technique",
         "target": "system",
@@ -1457,7 +1465,7 @@ def test_graph_verifier_request_caps_candidates_conservatively():
     )
 
     assert len(llm.verify_calls[0][1]) == MAX_GRAPH_VERIFIER_CANDIDATES
-    # Usage wording fails the local relation gate for every approved candidate.
+    # Co-occurrence fails the local relation gate for every approved candidate.
     assert dag.saved[0]["edges"] == []
 
 
@@ -1472,6 +1480,87 @@ def test_ingestion_keeps_thin_section_without_question_children():
     assert [call[0] for call in store.calls] == ["delete", "curriculum", "questions"]
     assert store.calls[-1][1] == []
 
+
+def test_short_section_body_skips_graph_extract_and_verify():
+    """Bodies under 200 stripped chars still persist; no graph compile path."""
+    short_text = "Brief intro only."
+    assert len(short_text.strip()) < 200
+    llm = SplitExtractionLLM()
+    llm.aot = {
+        "main_entities": [],
+        "learning_roadmap": [
+            {
+                "title": "Overview",
+                "content_focus": short_text,
+                "concepts": [],
+            }
+        ],
+        "knowledge_graph": {
+            "nodes": [{"name": "ShouldNotPersist"}],
+            "edges": [
+                {
+                    "source": "A",
+                    "relation": "PART_OF",
+                    "target": "B",
+                    "evidence_id": "e0",
+                }
+            ],
+        },
+    }
+    store = FakeStore()
+    dag = FakeDAG()
+
+    result = ingest_document(
+        "ignored.md",
+        store,
+        llm,
+        dag,
+        processor=FakeProcessor(
+            sections=[make_section(text=short_text, allow_thin=True)]
+        ),
+    )
+
+    assert result["ingested"] == ["lora.md::Method"]
+    assert [call[0] for call in store.calls] == ["delete", "curriculum", "questions"]
+    assert llm.graph_calls == 0
+    assert llm.verify_calls == []
+    assert dag.saved[0]["edges"] == []
+    assert result["graph_relationships"] == {
+        "candidates": 0,
+        "verifier_approvals": 0,
+        "retained": 0,
+    }
+
+
+def test_section_dedups_single_span_and_window_to_one_edge():
+    """Same triple from one span and a same-paragraph window keeps one edge."""
+    text = SECTION_TEXT
+    local_candidates, extra = propose_local_graph_candidates(text)
+    assert any(item["evidence_id"] == "e1" for item in local_candidates)
+    assert any(item["evidence_id"] == "e0+e1" for item in local_candidates)
+    assert extra
+    dag = FakeDAG()
+    result = ingest_document(
+        "ignored.md",
+        FakeStore(),
+        FakeLLM(),
+        dag,
+        processor=FakeProcessor(sections=[make_section(text=text)]),
+    )
+
+    edges = dag.saved[0]["edges"]
+    assert len(edges) == 1
+    assert edges[0] == {
+        "source": "low-rank matrix",
+        "relation": "PART_OF",
+        "target": "LoRA",
+    }
+    assert result["graph_relationships"]["candidates"] == len(local_candidates)
+    assert result["graph_relationships"]["retained"] == 1
+    audit = result["graph_relationships"]["retained_edge_audit"]
+    assert len(audit) == 1
+    assert audit[0]["evidence_id"] == "e1"
+    assert "+" not in audit[0]["evidence_id"]
 
 def test_empty_parse_fails_before_database_or_graph_mutation():
     empty_processor = FakeProcessor(
@@ -1624,6 +1713,56 @@ def test_compile_uploaded_markdown_skips_mineru(tmp_path):
     assert store.calls
 
 
+def test_compile_uploaded_markdown_uses_sibling_complete_mineru_manifest(tmp_path):
+    markdown_path = tmp_path / "already.md"
+    markdown_path.write_text(
+        "# Title\n\n## Abstract\nA compact update is a component of the adapter method.\n"
+        "## References\n1. Someone. A paper.\n"
+    )
+    manifest_path = tmp_path / "already.manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source": "already.pdf",
+                "page_count": 1,
+                "complete": True,
+                "markdown_path": str(markdown_path),
+                "chunks": [
+                    {
+                        "page_range": "1-1",
+                        "start_page": 1,
+                        "end_page": 1,
+                        "task_id": "task-1",
+                        "state": "done",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class RecordingProcessor(FakeProcessor):
+        def __init__(self):
+            super().__init__(sections=[make_section()])
+            self.mineru_calls = []
+
+        def process_mineru_markdown(self, file_path, manifest_path):
+            self.mineru_calls.append((str(file_path), str(manifest_path)))
+            return self.sections
+
+    processor = RecordingProcessor()
+    compile_uploaded_document(
+        markdown_path,
+        FakeStore(),
+        FakeLLM(),
+        FakeDAG(),
+        processor=processor,
+    )
+
+    assert sibling_complete_mineru_manifest(markdown_path) == manifest_path
+    assert processor.mineru_calls == [(str(markdown_path), str(manifest_path))]
+
+
 def test_force_reingest_removes_stale_current_source_only_after_success():
     obsolete_metadata = {
         "source": "lora.md",
@@ -1773,30 +1912,25 @@ def test_split_plan_graph_and_questions_overlap_and_merge_without_context_aliasi
             "relation": "PART_OF",
             "target": "LoRA",
         },
-        {
-            "source": "low-rank matrix",
-            "relation": "PART_OF",
-            "target": "LoRA",
-        },
     ]
     assert all("evidence_id" not in edge for edge in dag.saved[0]["edges"])
 
 
 def test_split_graph_runs_when_local_scan_is_empty():
     """Without local candidates, split graph extraction still runs."""
-    text = "The system uses a technique."
+    text = "Alpha and Beta appear together."
     llm = SplitExtractionLLM()
     llm.aot = {
-        "main_entities": ["system", "technique"],
+        "main_entities": ["Alpha", "Beta"],
         "learning_roadmap": [
             {
                 "title": "Usage",
-                "content_focus": "The system uses a technique.",
-                "concepts": ["system", "technique"],
+                "content_focus": "Alpha and Beta appear together.",
+                "concepts": ["Alpha", "Beta"],
             }
         ],
         "knowledge_graph": {
-            "nodes": [{"name": "system"}, {"name": "technique"}],
+            "nodes": [{"name": "Alpha"}, {"name": "Beta"}],
             "edges": [],
         },
     }
@@ -1817,13 +1951,15 @@ def test_split_graph_runs_when_local_scan_is_empty():
     assert llm.questions_started.is_set()
     assert llm.plan_node_calls == [[]]
     assert llm.graph_node_calls == [[]]
-    # Usage wording yields no local PART_OF and no retained edges here.
+    # Co-occurrence yields no local candidate and no retained edges here.
     assert dag.saved[0]["edges"] == []
 
 
 def test_local_part_of_candidates_persist_without_verifier():
     """Matcher-grounded local candidates skip the verifier and still persist."""
-    text = "A compact update is a component of the adapter method."
+    text = _ensure_graph_body(
+        "A compact update is a component of the adapter method."
+    )
     local_candidates, _extra = propose_local_graph_candidates(text)
     assert local_candidates
     llm = SplitExtractionLLM()
@@ -1873,19 +2009,19 @@ def test_split_graph_failure_persists_section_without_edges():
             raise RuntimeError("split graph extraction failed")
 
     # Empty local scan so the split graph extractor is still invoked.
-    text = "The system uses a technique."
+    text = "Alpha and Beta appear together."
     llm = FailingSplitGraph()
     llm.aot = {
-        "main_entities": ["system", "technique"],
+        "main_entities": ["Alpha", "Beta"],
         "learning_roadmap": [
             {
                 "title": "Usage",
-                "content_focus": "The system uses a technique.",
-                "concepts": ["system", "technique"],
+                "content_focus": "Alpha and Beta appear together.",
+                "concepts": ["Alpha", "Beta"],
             }
         ],
         "knowledge_graph": {
-            "nodes": [{"name": "system"}, {"name": "technique"}],
+            "nodes": [{"name": "Alpha"}, {"name": "Beta"}],
             "edges": [],
         },
     }
@@ -1915,11 +2051,11 @@ def test_middle_section_graph_failure_does_not_block_later_section():
             self.graph_calls += 1
             self.graph_started.set()
             self.graph_node_calls.append(list(existing_nodes))
-            if "uses a technique" in text:
+            if "appear together" in text:
                 raise RuntimeError("split graph extraction failed")
             return {"knowledge_graph": self.aot["knowledge_graph"]}
 
-    usage_text = "The system uses a technique."
+    usage_text = "Alpha and Beta appear together."
     sections = [
         make_section("Usage", usage_text, 0),
         make_section("Method", SECTION_TEXT, 1),
@@ -1937,7 +2073,7 @@ def test_middle_section_graph_failure_does_not_block_later_section():
     )
 
     assert result["ingested"] == ["lora.md::Usage", "lora.md::Method"]
-    # Usage-only section forced the graph path once; Method used local candidates.
+    # Co-occurrence section forced the graph path once; Method used local candidates.
     assert llm.graph_calls == 1
     assert len(dag.saved) == 2
     assert dag.saved[0]["edges"] == []
@@ -1949,7 +2085,7 @@ def test_middle_section_graph_failure_does_not_block_later_section():
 
 
 def test_graph_verification_overlaps_questions_with_two_workers():
-    # Usage-only text keeps the local scan empty so the LLM verifier still runs.
+    # Co-occurrence keeps the local scan empty so the LLM verifier still runs.
     llm = ConcurrentVerifierLLM()
     llm.aot = make_aot()
     llm.aot["knowledge_graph"]["edges"] = [
@@ -1967,7 +2103,7 @@ def test_graph_verification_overlaps_questions_with_two_workers():
         llm,
         FakeDAG(),
         processor=FakeProcessor(
-            sections=[make_section(text="The system uses a technique.")]
+            sections=[make_section(text="The system and the technique appear together.")]
         ),
     )
 
@@ -2010,7 +2146,7 @@ def test_graph_verification_failure_writes_nothing_for_current_section():
             llm,
             dag,
             processor=FakeProcessor(
-                sections=[make_section(text="The system uses a technique.")]
+                sections=[make_section(text="The system and the technique appear together.")]
             ),
         )
 
@@ -2245,7 +2381,8 @@ def test_propose_local_graph_candidates_composed_of_keeps_formula_noun_phrase():
     )
     usage = "The encoder uses a stack of N = 6 identical layers."
     usage_candidates, _ = propose_local_graph_candidates(usage)
-    assert usage_candidates == []
+    assert any(item["relation"] == "USES" for item in usage_candidates)
+    assert not any(item["relation"] == "PART_OF" for item in usage_candidates)
 
 
 def test_propose_local_graph_candidates_adjacent_same_paragraph_window():
@@ -2297,19 +2434,72 @@ def test_propose_local_graph_candidates_blank_line_does_not_join_spans():
 
 
 @pytest.mark.parametrize(
-    "section",
+    ("section", "relation", "source", "target"),
     [
-        "The system uses a technique.",
-        "The model has residual connections.",
-        "The model exhibits residual connections.",
-        "The model is evaluated on a benchmark.",
-        "The approach is based on self attention.",
-        "Quantization is applied to the weights.",
-        "Alpha is not a component of Beta.",
-        "Alpha and Beta appear together.",
+        ("The system uses a technique.", "USES", "system", "technique"),
+        ("The model has residual connections.", "HAS_FEATURE", "model", "residual connections"),
+        ("The model exhibits residual connections.", "HAS_FEATURE", "model", "residual connections"),
+        ("The model has positional encodings.", "HAS_FEATURE", "model", "positional encodings"),
+        ("The model is evaluated on a benchmark.", "EVALUATED_ON", "model", "benchmark"),
+        ("The approach is based on self attention.", "BASED_ON", "approach", "self attention"),
+        ("Quantization is applied to the weights.", "APPLIED_TO", "Quantization", "weights"),
+        (
+            "The key components powering SLMs are quantization.",
+            "PART_OF",
+            "quantization",
+            "SLMs",
+        ),
+        ("FFN is a component of the layer.", "PART_OF", "FFN", "layer"),
     ],
 )
-def test_propose_local_graph_candidates_rejects_generic_near_miss_wording(section):
+def test_propose_local_graph_candidates_maps_research_wording(
+    section, relation, source, target
+):
+    candidates, extra_spans = propose_local_graph_candidates(section)
+    assert extra_spans == []
+    assert any(
+        item["relation"] == relation
+        and item["source"] == source
+        and item["target"] == target
+        for item in candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "Alpha is not a component of Beta.",
+        "Alpha and Beta appear together.",
+        "The choice has little bearing on the result.",
+        "Training requires less compute than before.",
+        "Models such enable transfer learning.",
+    ],
+)
+def test_propose_local_graph_candidates_rejects_negation_and_cooccurrence(section):
     candidates, extra_spans = propose_local_graph_candidates(section)
     assert candidates == []
     assert extra_spans == []
+
+
+def test_quote_gate_keeps_novel_relation_when_predicate_is_in_the_span():
+    text = "QLoRA fine-tunes LLaMA."
+    candidate = {
+        "source": "QLoRA",
+        "relation": "FINE_TUNES",
+        "target": "LLaMA",
+        "evidence_id": "e0",
+    }
+    assert _approved_graph_edges(text, [candidate], [{"index": 0}]) == [
+        {"source": "QLoRA", "relation": "FINE_TUNES", "target": "LLaMA"}
+    ]
+
+
+def test_quote_gate_rejects_novel_relation_without_predicate():
+    text = "QLoRA and LLaMA appear together."
+    candidate = {
+        "source": "QLoRA",
+        "relation": "FINE_TUNES",
+        "target": "LLaMA",
+        "evidence_id": "e0",
+    }
+    assert _approved_graph_edges(text, [candidate], [{"index": 0}]) == []
